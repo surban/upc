@@ -1,0 +1,26 @@
+[package]
+name = "usb-packet"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["host", "device"]
+host = ["rusb"]
+device = ["usb-gadget"]
+
+[dependencies]
+futures-util = "0.3"
+tokio = { version = "1.33", features = ["macros", "rt"] }
+rusb = { version = "0.9", optional = true }
+usb-gadget = { version = "0.2", features = ["tokio"], optional = true }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "env-filter",
+    "fmt",
+] }
+
+[patch.crates-io]
+usb-gadget = { path = "../usb-gadget" }
