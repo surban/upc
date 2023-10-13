@@ -1,10 +1,15 @@
-//! Device-side USB packet channel.
+//! Device-side USB packet channel (UPC).
+//!
+//! Use [`UpcFunction::new`] to create an USB function that accepts incoming connections.
+//! Pass the returned handle to the [`usb_gadget`] library to expose the USB gadget.
+//!
 
 use futures_util::{future, FutureExt};
 use std::{
     fmt,
     future::Future,
     io::{Error, ErrorKind, Result},
+    mem::take,
     sync::Arc,
 };
 use tokio::{
@@ -17,7 +22,7 @@ use usb_gadget::function::{
     Handle,
 };
 
-use crate::{Class, BUFFER_SIZE, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN};
+use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
 
 /// Sends data into a USB packet channel.
 pub struct UpcSender {
@@ -32,6 +37,9 @@ impl fmt::Debug for UpcSender {
 
 impl UpcSender {
     /// Send packet.
+    ///
+    /// ## Cancel safety
+    /// If canceled, no data will have been sent.
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
         self.tx.send(data).await.map_err(|_| Error::new(ErrorKind::ConnectionReset, "connection closed"))
     }
@@ -47,6 +55,9 @@ impl UpcSender {
 pub struct UpcReceiver {
     topic: Vec<u8>,
     rx: mpsc::Receiver<Vec<u8>>,
+    buffer: Vec<u8>,
+    max_size: usize,
+    max_packet_size: usize,
 }
 
 impl fmt::Debug for UpcReceiver {
@@ -56,28 +67,60 @@ impl fmt::Debug for UpcReceiver {
 }
 
 impl UpcReceiver {
-    /// Topic provided by host.
+    /// Topic provided by host when establishing the connection.
     pub fn topic(&self) -> &[u8] {
         &self.topic
     }
 
     /// Receive packet.
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await
+    ///
+    /// ## Cancel safety
+    /// If canceled, no data will have been removed from the receive queue.
+    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+        loop {
+            let packet = self
+                .rx
+                .recv()
+                .await
+                .ok_or_else(|| Error::new(ErrorKind::ConnectionReset, "connection closed"))?;
+            self.buffer.extend_from_slice(&packet);
+
+            if self.buffer.len() > self.max_size {
+                self.buffer.clear();
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "incoming packet exceeds maximum receive packet size",
+                ));
+            }
+
+            if packet.len() < self.max_packet_size {
+                return Ok(take(&mut self.buffer));
+            }
+        }
+    }
+
+    /// The maximum receive packet size.
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    /// Sets the maximum receive packet size.
+    pub fn set_max_size(&mut self, max_size: usize) {
+        self.max_size = max_size;
     }
 }
 
 struct Head {
     tx: mpsc::Sender<Vec<u8>>,
-    rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    rx: mpsc::Receiver<Vec<u8>>,
 }
 
-fn connection(topic: Vec<u8>) -> (UpcSender, UpcReceiver, Head) {
-    let (tx_in, rx_in) = mpsc::channel(16);
-    let (tx_out, rx_out) = mpsc::channel(16);
+fn connection(topic: Vec<u8>, max_packet_size: usize) -> (UpcSender, UpcReceiver, Head) {
+    let (tx_in, rx_in) = mpsc::channel(32);
+    let (tx_out, rx_out) = mpsc::channel(32);
     let sender = UpcSender { tx: tx_out };
-    let recv = UpcReceiver { topic, rx: rx_in };
-    let head = Head { tx: tx_in, rx: Mutex::new(rx_out) };
+    let recv = UpcReceiver { topic, rx: rx_in, buffer: Vec::new(), max_size: MAX_SIZE, max_packet_size };
+    let head = Head { tx: tx_in, rx: rx_out };
     (sender, recv, head)
 }
 
@@ -99,6 +142,10 @@ impl fmt::Debug for UpcFunction {
 impl UpcFunction {
     /// Creates a new USB packet device-side interface with the specified interface class
     /// and interface name.
+    ///
+    /// Keep the returned `UpcFunction` and pass the [`Handle`] to
+    /// [`usb_gadget::Config::with_function`] to include the interface in your
+    /// USB gadget.
     pub fn new(class: Class, name: impl AsRef<str>) -> (Self, Handle) {
         let name = name.as_ref();
 
@@ -123,11 +170,18 @@ impl UpcFunction {
     }
 
     /// Sets the info data readable by host.
+    ///
+    /// # Panics
+    /// Panics if info is larger than [`INFO_SIZE`].
     pub async fn set_info(&self, info: Vec<u8>) {
+        assert!(info.len() <= INFO_SIZE, "info too big");
         *self.info.lock().await = info;
     }
 
     /// Waits for and accepts an incoming connection.
+    /// 
+    /// ## Cancel safety
+    /// If canceled, no connection will have been accepted.
     pub async fn accept(&mut self) -> Result<(UpcSender, UpcReceiver)> {
         match self.conn_rx.recv().await {
             Some(conn) => Ok(conn),
@@ -140,142 +194,166 @@ impl UpcFunction {
         }
     }
 
+    async fn in_task(ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
+        let mut ep_rx = ep_rx.lock().await;
+        let max_packet_size = ep_rx.max_packet_size()?;
+
+        while let Ok(permit) = tx.reserve().await {
+            if let Some(data) = ep_rx.recv_async(max_packet_size).await? {
+                permit.send(data);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn out_task(ep_tx: &Mutex<EndpointSender>, mut rx: mpsc::Receiver<Vec<u8>>) -> Result<()> {
+        let mut ep_tx = ep_tx.lock().await;
+        let max_packet_size = ep_tx.max_packet_size()?;
+
+        while let Some(data) = rx.recv().await {
+            let mut data = data.as_slice();
+            loop {
+                let part = &data[..data.len().min(max_packet_size)];
+                ep_tx.send_async(part.to_vec()).await?;
+                if part.len() == max_packet_size {
+                    data = &data[max_packet_size..];
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn task(
-        mut ep0: Custom, mut ep_tx: EndpointSender, mut ep_rx: EndpointReceiver,
+        mut ep0: Custom, mut ep_tx: EndpointSender, ep_rx: EndpointReceiver,
         conn_tx: mpsc::Sender<(UpcSender, UpcReceiver)>, info: Arc<Mutex<Vec<u8>>>,
     ) -> Result<()> {
-        ep0.status().bound().await?;
+        let status = ep0.status();
 
-        let mut conn: Option<Head> = None;
+        tracing::debug!("waiting for device bind");
+        status.bound().await?;
+
+        let max_packet_size = ep_tx.max_packet_size()?;
+        tracing::debug!("maximum packet size is {max_packet_size} bytes");
+
+        let ep_tx = Mutex::new(ep_tx);
+        let ep_rx = Mutex::new(ep_rx);
+
+        let mut in_task = future::pending().boxed();
+        let mut out_task = future::pending().boxed();
+
+        let mut do_stop = false;
+        let mut do_halt = false;
 
         loop {
-            let status = ep0.status();
+            if do_stop || do_halt {
+                tracing::debug!("canceling endpoint transfers");
+                in_task = future::pending().boxed();
+                out_task = future::pending().boxed();
+                ep_tx.lock().await.cancel()?;
+                ep_rx.lock().await.cancel()?;
+                do_stop = false;
+            }
 
-            let conn_task_tx = match &conn {
-                Some(conn) => async {
-                    match conn.rx.lock().await.recv().await {
-                        Some(data) => match ep_tx.send_async(data).await {
-                            Ok(()) => true,
-                            Err(err) => {
-                                tracing::warn!("send error: {err}");
-                                false
-                            }
-                        },
-                        None => {
-                            tracing::debug!("connection closed");
-                            false
-                        }
-                    }
-                }
-                .left_future(),
-                None => future::pending().right_future(),
-            };
-
-            let conn_task_rx = match &conn {
-                Some(conn) => async {
-                    match ep_rx.recv_async(BUFFER_SIZE).await {
-                        Ok(Some(data)) => conn.tx.send(data).await.is_ok(),
-                        Ok(None) => true,
-                        Err(err) => {
-                            tracing::warn!("receive error: {err}");
-                            false
-                        }
-                    }
-                }
-                .left_future(),
-                None => future::pending().right_future(),
-            };
-
-            let event_task = async {
-                ep0.wait_event().await?;
-                match ep0.event()? {
-                    Event::Enable => tracing::debug!("device enabled"),
-                    Event::Disable => {
-                        tracing::debug!("device disabled");
-                        return Ok(Some(None));
-                    }
-                    Event::SetupHostToDevice(req) => {
-                        let ctrl_req = req.ctrl_req();
-                        tracing::debug!("incoming control request: {ctrl_req:?}");
-                        match ctrl_req.request {
-                            CTRL_REQ_OPEN => {
-                                tracing::debug!("open connection request");
-                                if let Ok(permit) = conn_tx.reserve().await {
-                                    match req.recv_all() {
-                                        Ok(topic) => {
-                                            let (conn_tx, conn_rx, conn_head) = connection(topic);
-                                            permit.send((conn_tx, conn_rx));
-                                            return Ok(Some(Some(conn_head)));
-                                        }
-                                        Err(err) => tracing::warn!("topic receive error: {err}"),
-                                    }
-                                }
-                            }
-                            CTRL_REQ_CLOSE => {
-                                tracing::debug!("close connection request");
-                                return Ok(Some(None));
-                            }
-                            other => tracing::warn!("unknown control request {other:x}"),
-                        }
-                    }
-                    Event::SetupDeviceToHost(req) => {
-                        let ctrl_req = req.ctrl_req();
-                        tracing::debug!("outgoing control request: {ctrl_req:?}");
-                        match ctrl_req.request {
-                            CTRL_REQ_INFO => {
-                                tracing::debug!("sending info");
-                                let info = info.lock().await;
-                                if let Err(err) = req.send(&info) {
-                                    tracing::warn!("info send error: {err}");
-                                }
-                            }
-                            other => tracing::warn!("unknown control request {other:x}"),
-                        }
-                    }
-                    _ => (),
-                }
-
-                Ok::<_, Error>(None)
-            };
+            if do_halt {
+                tracing::debug!("halting endpoints");
+                ep_tx.lock().await.control()?.halt()?;
+                ep_rx.lock().await.control()?.halt()?;
+                do_halt = false;
+            }
 
             tokio::select! {
                 () = status.unbound() => {
                     tracing::debug!("device unbound");
                     break;
                 }
+
                 () = conn_tx.closed() => {
                     tracing::debug!("UsbPacketDevice dropped");
                     break;
                 }
-                ok = conn_task_tx => {
-                    if !ok {
-                        tracing::debug!("connection closed locally");
-                        conn = None;
-                        ep_tx.cancel()?;
-                        ep_rx.cancel()?;
-                        ep_tx.control()?.halt()?;
-                        ep_rx.control()?.halt()?;
-                    }
-                }
-                ok = conn_task_rx => {
-                    if !ok {
-                        tracing::debug!("connection closed locally");
-                        conn = None;
-                        ep_tx.cancel()?;
-                        ep_rx.cancel()?;
-                        ep_tx.control()?.halt()?;
-                        ep_rx.control()?.halt()?;
-                    }
-                }
-                res = event_task => {
-                    if let Some(new_conn) = res? {
-                        conn = new_conn;
-                        if conn.is_none() {
-                            ep_tx.cancel()?;
-                            ep_rx.cancel()?;
+
+                res = ep0.wait_event() => {
+                    res?;
+
+                    match ep0.event()? {
+                        Event::Enable => tracing::debug!("device enabled"),
+
+                        Event::Disable => {
+                            tracing::debug!("device disabled");
+                            do_stop = true;
                         }
+
+                        Event::SetupHostToDevice(req) => {
+                            let ctrl_req = req.ctrl_req();
+                            tracing::debug!("incoming control request: {ctrl_req:?}");
+                            match ctrl_req.request {
+                                CTRL_REQ_OPEN => {
+                                    tracing::debug!("open connection request");
+                                    // WORKAROUND: some UDCs fail the first incoming transfer when no
+                                    //             receive buffers are enqueued.
+                                    while ep_rx.lock().await.try_recv(max_packet_size).is_ok() {}
+                                    match req.recv_all() {
+                                        Ok(topic) => {
+                                            let (ctx, crx, Head { tx, rx }) = connection(topic, max_packet_size);
+                                            let _ = conn_tx.send((ctx, crx)).await;
+                                            in_task = Self::in_task(&ep_rx, tx).boxed();
+                                            out_task = Self::out_task(&ep_tx, rx).boxed();
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!("topic receive error: {err}");
+                                            ep_rx.lock().await.cancel()?;
+                                        }
+                                    }
+                                }
+                                CTRL_REQ_CLOSE => {
+                                    tracing::debug!("close connection request");
+                                    if let Err(err) = req.recv_all() {
+                                        tracing::warn!("close request receive error: {err}");
+                                    }
+                                    do_stop = true;
+                                }
+                                other => tracing::warn!("unknown control request {other:x}"),
+                            }
+                        }
+
+                        Event::SetupDeviceToHost(req) => {
+                            let ctrl_req = req.ctrl_req();
+                            tracing::debug!("outgoing control request: {ctrl_req:?}");
+                            match ctrl_req.request {
+                                CTRL_REQ_INFO => {
+                                    tracing::debug!("sending info");
+                                    if let Err(err) = req.send(&info.lock().await) {
+                                        tracing::warn!("info send error: {err}");
+                                    }
+                                }
+                                other => tracing::warn!("unknown control request {other:x}"),
+                            }
+                        }
+
+                        _ => (),
                     }
                 }
+
+                res = &mut in_task => {
+                    match res {
+                        Ok(()) => tracing::debug!("receiver dropped"),
+                        Err(err) => tracing::warn!("receiver failed: {err}")
+                    }
+                    do_halt = true;
+                }
+
+                res = &mut out_task => {
+                    match res {
+                        Ok(()) => tracing::debug!("sender dropped"),
+                        Err(err) => tracing::warn!("sender failed: {err}")
+                    }
+                    do_halt = true;
+                }
+
             }
         }
 

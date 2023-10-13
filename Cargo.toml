@@ -1,7 +1,14 @@
 [package]
-name = "usb-packet"
+name = "upc"
+description = "USB packet channel (UPC): provides a reliable, packet-based transport over USB."
+categories = ["hardware-support", "asynchronous"]
+keywords = ["usb", "packet", "channel"]
+license = "Apache-2.0"
+repository = "https://github.com/surban/upc"
+authors = ["Sebastian Urban <surban@surban.net>"]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.73"
 
 [features]
 default = ["host", "device"]
@@ -12,7 +19,7 @@ device = ["usb-gadget"]
 futures-util = "0.3"
 tokio = { version = "1.33", features = ["macros", "rt"] }
 rusb = { version = "0.9", optional = true }
-usb-gadget = { version = "0.2", features = ["tokio"], optional = true }
+usb-gadget = { version = "0.3", features = ["tokio"], optional = true }
 tracing = "0.1"
 
 [dev-dependencies]
@@ -21,6 +28,13 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "env-filter",
     "fmt",
 ] }
+tracing-log = "0.1"
+rand_xoshiro = "0.6"
+rand = "0.8"
 
-[patch.crates-io]
-usb-gadget = { path = "../usb-gadget" }
+# [patch.crates-io]
+# usb-gadget = { path = "../usb-gadget" }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

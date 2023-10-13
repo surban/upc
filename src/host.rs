@@ -1,8 +1,12 @@
-//! Host-side USB packet channel.
+//! Host-side USB packet channel (UPC).
+//!
+//! To open a channel, use [`rusb`] to find the target device and then pass it to [`connect`].
+//!
 
 use std::{
     fmt,
     future::Future,
+    mem::take,
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::Duration,
@@ -17,7 +21,7 @@ use tokio::{
     task::spawn_blocking,
 };
 
-use crate::{Class, BUFFER_SIZE, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN};
+use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
 
 const IN_REQUEST: u8 = request_type(Direction::In, RequestType::Vendor, Recipient::Interface);
 const OUT_REQUEST: u8 = request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
@@ -25,6 +29,8 @@ const OUT_REQUEST: u8 = request_type(Direction::Out, RequestType::Vendor, Recipi
 const TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Finds the interface by class and optional interface name.
+///
+/// Returns the interface number.
 pub fn find_interface<C: UsbContext>(dev: &Device<C>, class: Class, name: Option<impl AsRef<str>>) -> Result<u8> {
     let name = name.as_ref().map(|s| s.as_ref());
     let cfg = dev.active_config_descriptor()?;
@@ -61,6 +67,8 @@ fn read_string<C: UsbContext>(dev: &Device<C>, idx: u8) -> Result<String> {
 }
 
 /// Read the device-provided information on the specified device and interface.
+///
+/// The maximum size of the data is [`INFO_SIZE`].
 pub fn info<C: UsbContext + 'static>(dev: &Device<C>, interface: u8) -> Result<Vec<u8>> {
     // Open device and claim interface.
     let mut hnd = dev.open()?;
@@ -68,7 +76,7 @@ pub fn info<C: UsbContext + 'static>(dev: &Device<C>, interface: u8) -> Result<V
 
     // Read info.
     tracing::debug!("reading info");
-    let mut info = vec![0; BUFFER_SIZE];
+    let mut info = vec![0; INFO_SIZE];
     let n = hnd.read_control(IN_REQUEST, CTRL_REQ_INFO, 0, interface.into(), &mut info, TIMEOUT)?;
     info.truncate(n);
 
@@ -89,6 +97,9 @@ impl fmt::Debug for UpcSender {
 
 impl UpcSender {
     /// Send packet.
+    ///
+    /// ## Cancel safety
+    /// If canceled, no data will have been sent.
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
@@ -107,6 +118,9 @@ impl UpcSender {
 pub struct UpcReceiver {
     rx: mpsc::Receiver<Vec<u8>>,
     shared: Arc<UpcShared>,
+    buffer: Vec<u8>,
+    max_size: usize,
+    max_transfer_size: usize,
 }
 
 impl fmt::Debug for UpcReceiver {
@@ -117,8 +131,28 @@ impl fmt::Debug for UpcReceiver {
 
 impl UpcReceiver {
     /// Receive packet.
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        self.rx.recv().await
+    ///
+    /// ## Cancel safety
+    /// If canceled, no data will have been removed from the receive queue.
+    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+        loop {
+            let packet = self.rx.recv().await.ok_or(Error::Pipe)?;
+            self.buffer.extend_from_slice(&packet);
+
+            if self.buffer.len() > self.max_size {
+                self.buffer.clear();
+                return Err(Error::Overflow);
+            }
+
+            if packet.len() < self.max_transfer_size {
+                return Ok(take(&mut self.buffer));
+            }
+        }
+    }
+
+    /// Sets the maximum packet size.
+    pub fn set_max_size(&mut self, max_size: usize) {
+        self.max_size = max_size;
     }
 }
 
@@ -141,16 +175,26 @@ impl Drop for UpcShared {
 }
 
 /// Connect to the specified device and interface.
+///
+/// Use [`find_interface`] to determine the `interface` number.
+/// The `topic` is provided to the device and may contain user-defined data.
+///
+/// # Panics
+/// Panics if the size of `topic` is larger than [`INFO_SIZE`].
 pub async fn connect<C: UsbContext + 'static>(
     dev: &Device<C>, interface: u8, topic: &[u8],
 ) -> Result<(UpcSender, UpcReceiver)> {
+    assert!(topic.len() <= INFO_SIZE, "topic too big");
+
     // Get endpoints.
     let cfg = dev.active_config_descriptor()?;
     let iface_desc = cfg.interfaces().find(|i| i.number() == interface).ok_or(Error::NotFound)?;
     let mut ep_in = None;
     let mut ep_out = None;
+    let mut max_packet_size = usize::MAX;
     for desc in iface_desc.descriptors() {
         for ep in desc.endpoint_descriptors() {
+            max_packet_size = max_packet_size.min(ep.max_packet_size().into());
             match ep.direction() {
                 Direction::In => ep_in = Some(ep.address()),
                 Direction::Out => ep_out = Some(ep.address()),
@@ -178,24 +222,25 @@ pub async fn connect<C: UsbContext + 'static>(
 
     // Start handler threads.
     let error = Arc::new(Mutex::new(Error::Pipe));
-    let name = format!(
-        "{}:{}",
-        dev.port_numbers()?.into_iter().map(|p| p.to_string()).collect::<Vec<_>>().join("-"),
-        interface
-    );
+    let name = format!("{}-{}:{}", dev.bus_number(), dev.address(), interface);
+    let closed = Arc::new(Mutex::new(false));
+
     let hnd_in = hnd.clone();
     let error_in = error.clone();
     let (tx_in, rx_in) = mpsc::channel(16);
+    let in_closed = closed.clone();
+    let max_transfer_size = max_packet_size * 128;
     let in_thread = thread::Builder::new()
         .name(format!("UPC {name} in"))
-        .spawn(move || in_thread(hnd_in, tx_in, ep_in, interface, error_in))
+        .spawn(move || in_thread(hnd_in, tx_in, ep_in, interface, error_in, max_transfer_size, in_closed))
         .unwrap();
+
     let (tx_out, rx_out) = mpsc::channel(16);
     let error_out = error.clone();
     let (stop_tx, stop_rx) = oneshot::channel();
     let out_thread = thread::Builder::new()
         .name(format!("UPC {name} out"))
-        .spawn(move || out_thread(hnd, rx_out, ep_out, interface, error_out, stop_rx))
+        .spawn(move || out_thread(hnd, rx_out, ep_out, interface, error_out, stop_rx, max_packet_size, closed))
         .unwrap();
 
     // Build objects.
@@ -207,16 +252,17 @@ pub async fn connect<C: UsbContext + 'static>(
         stop_tx: Some(stop_tx),
     });
     let sender = UpcSender { tx: tx_out, shared: shared.clone() };
-    let recv = UpcReceiver { rx: rx_in, shared };
+    let recv = UpcReceiver { rx: rx_in, shared, buffer: Vec::new(), max_size: MAX_SIZE, max_transfer_size };
 
     Ok((sender, recv))
 }
 
 fn in_thread<C: UsbContext>(
     hnd: Arc<DeviceHandle<C>>, tx: mpsc::Sender<Vec<u8>>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
+    max_transfer_size: usize, closed: Arc<Mutex<bool>>,
 ) {
     while !tx.is_closed() {
-        let mut buf = vec![0; BUFFER_SIZE];
+        let mut buf = vec![0; max_transfer_size];
         match hnd.read_bulk(ep, &mut buf, TIMEOUT) {
             Ok(n) => {
                 buf.truncate(n);
@@ -233,26 +279,38 @@ fn in_thread<C: UsbContext>(
         }
     }
 
-    close(&hnd, iface);
+    let mut closed = closed.lock().unwrap();
+    if !*closed {
+        close(&hnd, iface);
+        *closed = true;
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn out_thread<C: UsbContext>(
     hnd: Arc<DeviceHandle<C>>, mut rx: mpsc::Receiver<Vec<u8>>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
-    mut stop_rx: oneshot::Receiver<()>,
+    mut stop_rx: oneshot::Receiver<()>, max_packet_size: usize, closed: Arc<Mutex<bool>>,
 ) {
-    'outer: while let Some(buf) = rx.blocking_recv() {
+    'outer: while let Some(data) = rx.blocking_recv() {
+        let mut data = data.as_slice();
         loop {
             match stop_rx.try_recv() {
                 Err(TryRecvError::Empty) => (),
                 _ => break 'outer,
             }
 
-            match hnd.write_bulk(ep, &buf, TIMEOUT) {
-                Ok(n) => {
-                    if n != buf.len() {
-                        panic!("partial send {n} != {}", buf.len());
+            match hnd.write_bulk(ep, data, TIMEOUT) {
+                Ok(n) if n != data.len() => {
+                    tracing::warn!("partial send: {n} / {} bytes", data.len());
+                    data = &data[n..];
+                }
+                Ok(_) => {
+                    if data.is_empty() || data.len() % max_packet_size != 0 {
+                        break;
+                    } else {
+                        // Send zero length packet to indicate end of transfer.
+                        data = &[];
                     }
-                    break;
                 }
                 Err(Error::Timeout) => (),
                 Err(err) => {
@@ -264,7 +322,11 @@ fn out_thread<C: UsbContext>(
         }
     }
 
-    close(&hnd, iface);
+    let mut closed = closed.lock().unwrap();
+    if !*closed {
+        close(&hnd, iface);
+        *closed = true;
+    }
 }
 
 fn close<C: UsbContext>(hnd: &DeviceHandle<C>, iface: u8) {

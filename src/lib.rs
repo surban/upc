@@ -1,4 +1,12 @@
-//! USB packet library
+//! # USB packet channel (UPC).
+//!
+//! This library provides a reliable, packet-based transport over a physical USB connection
+//! with an asynchronous API.
+//!
+
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 #[cfg(feature = "device")]
 pub mod device;
@@ -6,11 +14,11 @@ pub mod device;
 #[cfg(feature = "host")]
 pub mod host;
 
-const CTRL_REQ_OPEN: u8 = 1;
-const CTRL_REQ_CLOSE: u8 = 2;
-const CTRL_REQ_INFO: u8 = 3;
+/// Maximum info size.
+pub const INFO_SIZE: usize = 4096;
 
-const BUFFER_SIZE: usize = 65_536;
+/// Default maximum packet size.
+pub const MAX_SIZE: usize = 16_777_216;
 
 /// USB interface class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,3 +52,7 @@ impl From<Class> for usb_gadget::Class {
         usb_gadget::Class { class, sub_class, protocol }
     }
 }
+
+const CTRL_REQ_OPEN: u8 = 1;
+const CTRL_REQ_CLOSE: u8 = 2;
+const CTRL_REQ_INFO: u8 = 3;

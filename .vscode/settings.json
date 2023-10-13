@@ -3,4 +3,18 @@
     "files.exclude": {
         "target/": true,
     },
+    "cSpell.languageSettings": [
+        {
+            "languageId": "rust",
+            "includeRegExpList": [
+                "CStyleComment"
+            ]
+        }
+    ],
+    "cSpell.words": [
+        "libusb",
+        "MSRV",
+        "rusb",
+        "UDCs"
+    ],
 }
