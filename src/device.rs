@@ -179,7 +179,7 @@ impl UpcFunction {
     }
 
     /// Waits for and accepts an incoming connection.
-    /// 
+    ///
     /// ## Cancel safety
     /// If canceled, no connection will have been accepted.
     pub async fn accept(&mut self) -> Result<(UpcSender, UpcReceiver)> {
