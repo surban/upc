@@ -2,7 +2,7 @@
 name = "upc"
 description = "USB packet channel (UPC): provides a reliable, packet-based transport over USB."
 categories = ["hardware-support", "asynchronous"]
-keywords = ["usb", "packet", "channel"]
+keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
