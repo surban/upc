@@ -219,6 +219,7 @@ pub async fn connect<C: UsbContext + 'static>(
     })
     .await
     .unwrap()?;
+    tracing::debug!("connection is open");
 
     // Start handler threads.
     let error = Arc::new(Mutex::new(Error::Pipe));
@@ -301,7 +302,6 @@ fn out_thread<C: UsbContext>(
 
             match hnd.write_bulk(ep, data, TIMEOUT) {
                 Ok(n) if n != data.len() => {
-                    tracing::warn!("partial send: {n} / {} bytes", data.len());
                     data = &data[n..];
                 }
                 Ok(_) => {
@@ -330,6 +330,7 @@ fn out_thread<C: UsbContext>(
 }
 
 fn close<C: UsbContext>(hnd: &DeviceHandle<C>, iface: u8) {
+    tracing::debug!("closing connection");
     if let Err(err) = hnd.write_control(OUT_REQUEST, CTRL_REQ_CLOSE, 0, iface.into(), &[], TIMEOUT) {
         tracing::warn!("closing connection failed: {err}");
     }
