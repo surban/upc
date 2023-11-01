@@ -16,6 +16,8 @@ use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
 };
+use usb_gadget::function::custom::OsExtProp;
+use uuid::Uuid;
 
 use usb_gadget::function::{
     custom::{
@@ -126,6 +128,44 @@ fn connection(topic: Vec<u8>, max_packet_size: usize) -> (UpcSender, UpcReceiver
     (sender, recv, head)
 }
 
+/// USB interface id.
+#[derive(Debug, Clone)]
+pub struct InterfaceId {
+    /// Interface class.
+    pub class: Class,
+    /// Interface name.
+    pub name: String,
+    /// Device interface GUID for Microsoft OS.
+    pub guid: Option<Uuid>,
+}
+
+impl InterfaceId {
+    /// Creates a new interface id using the specified interface class.
+    pub fn new(class: Class) -> Self {
+        Self { class, name: "USB packet channel (UPC)".to_string(), guid: None }
+    }
+
+    /// Sets the interface name.
+    #[must_use]
+    pub fn with_name(mut self, name: impl AsRef<str>) -> Self {
+        self.name = name.as_ref().to_string();
+        self
+    }
+
+    /// Sets the device interface GUID for Microsoft OS.
+    #[must_use]
+    pub fn with_guid(mut self, guid: Uuid) -> Self {
+        self.guid = Some(guid);
+        self
+    }
+}
+
+impl From<Class> for InterfaceId {
+    fn from(class: Class) -> Self {
+        Self::new(class)
+    }
+}
+
 /// USB packet device-side function.
 pub struct UpcFunction {
     class: Class,
@@ -142,25 +182,24 @@ impl fmt::Debug for UpcFunction {
 }
 
 impl UpcFunction {
-    /// Creates a new USB packet device-side interface with the specified interface class
-    /// and interface name.
+    /// Creates a new USB packet device-side interface with the specified interface identification.
     ///
     /// Keep the returned `UpcFunction` and pass the [`Handle`] to
     /// [`usb_gadget::Config::with_function`] to include the interface in your
     /// USB gadget.
-    pub fn new(class: Class, name: impl AsRef<str>) -> (Self, Handle) {
-        let name = name.as_ref();
-
+    pub fn new(interface_id: InterfaceId) -> (Self, Handle) {
         let (ep_rx, ep_rx_dir) = EndpointDirection::host_to_device();
         let (ep_tx, ep_tx_dir) = EndpointDirection::device_to_host();
 
-        let builder = Custom::builder().with_interface(
-            Interface::new(class.into(), name)
-                .with_endpoint(Endpoint::bulk(ep_rx_dir))
-                .with_endpoint(Endpoint::bulk(ep_tx_dir))
-                .with_os_ext_compat(OsExtCompat::winusb()),
-        );
-        let (ep0, handle) = builder.build();
+        let mut interface = Interface::new(interface_id.class.into(), &interface_id.name)
+            .with_endpoint(Endpoint::bulk(ep_rx_dir))
+            .with_endpoint(Endpoint::bulk(ep_tx_dir))
+            .with_os_ext_compat(OsExtCompat::winusb());
+        if let Some(guid) = interface_id.guid {
+            interface = interface.with_os_ext_prop(OsExtProp::device_interface_guid(guid));
+        }
+
+        let (ep0, handle) = Custom::builder().with_interface(interface).build();
 
         let (conn_tx, conn_rx) = mpsc::channel(4);
         let info = Arc::new(Mutex::new(Vec::new()));
@@ -168,7 +207,7 @@ impl UpcFunction {
         let mut task = JoinSet::new();
         task.spawn(Self::task(ep0, ep_tx, ep_rx, conn_tx, info.clone()));
 
-        (Self { class, name: name.to_string(), task, conn_rx, info }, handle)
+        (Self { class: interface_id.class, name: interface_id.name.to_string(), task, conn_rx, info }, handle)
     }
 
     /// Sets the info data readable by host.
