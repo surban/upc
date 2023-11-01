@@ -17,4 +17,5 @@
         "rusb",
         "UDCs"
     ],
+    "rust-analyzer.cargo.features": "all",
 }

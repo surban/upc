@@ -13,7 +13,6 @@ use upc::Class;
 const VID: u16 = 4;
 const PID: u16 = 5;
 
-const DEVICE_CLASS: Class = Class::vendor_specific(22, 0);
 const CLASS: Class = Class::vendor_specific(22, 3);
 const NAME: &str = "USB-PACKET-TEST";
 const TOPIC: &[u8] = b"TEST TOPIC";
@@ -194,6 +193,8 @@ async fn host() {
 async fn device() {
     use upc::device::UpcFunction;
     use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
+
+    const DEVICE_CLASS: Class = Class::vendor_specific(22, 0);
 
     init_log();
     usb_gadget::remove_all().expect("cannot remove all USB gadgets");
