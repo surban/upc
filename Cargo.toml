@@ -6,7 +6,7 @@ keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.73"
 
@@ -19,8 +19,9 @@ device = ["usb-gadget"]
 futures-util = "0.3"
 tokio = { version = "1.33", features = ["macros", "rt", "sync"] }
 rusb = { version = "0.9", optional = true }
-usb-gadget = { version = "0.3", features = ["tokio"], optional = true }
+usb-gadget = { version = "0.4", features = ["tokio"], optional = true }
 tracing = "0.1"
+uuid = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["time"] }
@@ -32,8 +33,8 @@ tracing-log = "0.2"
 rand_xoshiro = "0.6"
 rand = "0.8"
 
-[patch.crates-io]
-usb-gadget = { path = "../usb-gadget" }
+# [patch.crates-io]
+# usb-gadget = { path = "../usb-gadget" }
 
 [package.metadata.docs.rs]
 all-features = true
