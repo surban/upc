@@ -53,6 +53,11 @@ impl From<Class> for usb_gadget::Class {
     }
 }
 
+#[cfg(any(feature = "host", feature = "device"))]
 const CTRL_REQ_OPEN: u8 = 1;
+
+#[cfg(any(feature = "host", feature = "device"))]
 const CTRL_REQ_CLOSE: u8 = 2;
+
+#[cfg(any(feature = "host", feature = "device"))]
 const CTRL_REQ_INFO: u8 = 3;
