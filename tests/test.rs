@@ -191,17 +191,20 @@ async fn host() {
 #[tokio::test]
 #[ignore = "host-side companion test required"]
 async fn device() {
-    use upc::device::UpcFunction;
+    use upc::device::{InterfaceId, UpcFunction};
     use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
+    use uuid::uuid;
 
-    const DEVICE_CLASS: Class = Class::vendor_specific(22, 0);
+    const DEVICE_CLASS: Class = Class::vendor_specific(0xff, 0);
 
     init_log();
     usb_gadget::remove_all().expect("cannot remove all USB gadgets");
     sleep(Duration::from_secs(1)).await;
 
     println!("Creating UPC function...");
-    let (mut upc, hnd) = UpcFunction::new(CLASS, NAME);
+    let (mut upc, hnd) = UpcFunction::new(
+        InterfaceId::new(CLASS).with_name(NAME).with_guid(uuid!("3bf77270-42d2-42c6-a475-490227a9cc89")),
+    );
     upc.set_info(INFO.to_vec()).await;
 
     println!("Registering gadget...");
@@ -209,12 +212,13 @@ async fn device() {
     let mut gadget = Gadget::new(DEVICE_CLASS.into(), Id::new(VID, PID), Strings::new("usb-packet", "test", "0"))
         .with_config(Config::new("config").with_function(hnd))
         .with_os_descriptor(OsDescriptor::microsoft());
-    gadget.device_release = 0x0102;
+    gadget.device_release = 0x0110;
     let reg = gadget.bind(&udc).expect("cannot bind to UDC");
     assert!(reg.is_attached());
 
     println!("Waiting for connection...");
     let (tx, mut rx) = upc.accept().await.expect("accept failed");
+    assert_eq!(rx.topic(), TOPIC, "wrong topic");
 
     let rx_task = tokio::spawn(async move {
         let mut rx_testdata = TestData::new(HOST_SEED, TEST_PACKET_MAX_SIZE);
