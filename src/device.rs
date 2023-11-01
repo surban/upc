@@ -18,7 +18,9 @@ use tokio::{
 };
 
 use usb_gadget::function::{
-    custom::{Custom, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface},
+    custom::{
+        Custom, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface, OsExtCompat,
+    },
     Handle,
 };
 
@@ -152,13 +154,13 @@ impl UpcFunction {
         let (ep_rx, ep_rx_dir) = EndpointDirection::host_to_device();
         let (ep_tx, ep_tx_dir) = EndpointDirection::device_to_host();
 
-        let (ep0, handle) = Custom::builder()
-            .with_interface(
-                Interface::new(class.into(), name)
-                    .with_endpoint(Endpoint::bulk(ep_rx_dir))
-                    .with_endpoint(Endpoint::bulk(ep_tx_dir)),
-            )
-            .build();
+        let builder = Custom::builder().with_interface(
+            Interface::new(class.into(), name)
+                .with_endpoint(Endpoint::bulk(ep_rx_dir))
+                .with_endpoint(Endpoint::bulk(ep_tx_dir))
+                .with_os_ext_compat(OsExtCompat::winusb()),
+        );
+        let (ep0, handle) = builder.build();
 
         let (conn_tx, conn_rx) = mpsc::channel(4);
         let info = Arc::new(Mutex::new(Vec::new()));

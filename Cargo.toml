@@ -32,8 +32,8 @@ tracing-log = "0.2"
 rand_xoshiro = "0.6"
 rand = "0.8"
 
-# [patch.crates-io]
-# usb-gadget = { path = "../usb-gadget" }
+[patch.crates-io]
+usb-gadget = { path = "../usb-gadget" }
 
 [package.metadata.docs.rs]
 all-features = true

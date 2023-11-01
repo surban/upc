@@ -193,7 +193,7 @@ async fn host() {
 #[ignore = "host-side companion test required"]
 async fn device() {
     use upc::device::UpcFunction;
-    use usb_gadget::{default_udc, Config, Gadget, Id, Strings};
+    use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
 
     init_log();
     usb_gadget::remove_all().expect("cannot remove all USB gadgets");
@@ -205,10 +205,11 @@ async fn device() {
 
     println!("Registering gadget...");
     let udc = default_udc().expect("cannot get UDC");
-    let reg = Gadget::new(DEVICE_CLASS.into(), Id::new(VID, PID), Strings::new("usb-packet", "test", "0"))
+    let mut gadget = Gadget::new(DEVICE_CLASS.into(), Id::new(VID, PID), Strings::new("usb-packet", "test", "0"))
         .with_config(Config::new("config").with_function(hnd))
-        .bind(&udc)
-        .expect("cannot bind to UDC");
+        .with_os_descriptor(OsDescriptor::microsoft());
+    gadget.device_release = 0x0102;
+    let reg = gadget.bind(&udc).expect("cannot bind to UDC");
     assert!(reg.is_attached());
 
     println!("Waiting for connection...");
