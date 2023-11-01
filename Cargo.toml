@@ -11,13 +11,13 @@ edition = "2021"
 rust-version = "1.73"
 
 [features]
-default = ["host", "device"]
+default = []
 host = ["rusb"]
 device = ["usb-gadget"]
 
 [dependencies]
 futures-util = "0.3"
-tokio = { version = "1.33", features = ["macros", "rt"] }
+tokio = { version = "1.33", features = ["macros", "rt", "sync"] }
 rusb = { version = "0.9", optional = true }
 usb-gadget = { version = "0.3", features = ["tokio"], optional = true }
 tracing = "0.1"
