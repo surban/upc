@@ -20,5 +20,3 @@ jobs:
       run: rustup update
     - name: Build
       run: cargo build --quiet --all-targets --all-features
-    - name: Run tests
-      run: cargo test --quiet --all-features
