@@ -5,12 +5,13 @@ use tokio::time::sleep;
 use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
 use uuid::uuid;
 
-use upc::device::{InterfaceId, UpcFunction};
-use upc::Class;
+use upc::{
+    device::{InterfaceId, UpcFunction},
+    Class,
+};
 
 mod common;
 use common::*;
-
 
 const DEVICE_CLASS: Class = Class::vendor_specific(0xff, 0);
 

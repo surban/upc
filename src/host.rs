@@ -187,17 +187,19 @@ pub async fn connect<C: UsbContext + 'static>(
     assert!(topic.len() <= INFO_SIZE, "topic too big");
 
     // Get endpoints.
-    let cfg = dev.active_config_descriptor()?;
-    let iface_desc = cfg.interfaces().find(|i| i.number() == interface).ok_or(Error::NotFound)?;
     let mut ep_in = None;
     let mut ep_out = None;
     let mut max_packet_size = usize::MAX;
-    for desc in iface_desc.descriptors() {
-        for ep in desc.endpoint_descriptors() {
-            max_packet_size = max_packet_size.min(ep.max_packet_size().into());
-            match ep.direction() {
-                Direction::In => ep_in = Some(ep.address()),
-                Direction::Out => ep_out = Some(ep.address()),
+    {
+        let cfg = dev.active_config_descriptor()?;
+        let iface_desc = cfg.interfaces().find(|i| i.number() == interface).ok_or(Error::NotFound)?;
+        for desc in iface_desc.descriptors() {
+            for ep in desc.endpoint_descriptors() {
+                max_packet_size = max_packet_size.min(ep.max_packet_size().into());
+                match ep.direction() {
+                    Direction::In => ep_in = Some(ep.address()),
+                    Direction::Out => ep_out = Some(ep.address()),
+                }
             }
         }
     }
@@ -333,5 +335,23 @@ fn close<C: UsbContext>(hnd: &DeviceHandle<C>, iface: u8) {
     tracing::debug!("closing connection");
     if let Err(err) = hnd.write_control(OUT_REQUEST, CTRL_REQ_CLOSE, 0, iface.into(), &[], TIMEOUT) {
         tracing::warn!("closing connection failed: {err}");
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Verify that connect function is Send.
+    #[tokio::test]
+    async fn connect_is_send() {
+        let dev = {
+            let Ok(devs) = rusb::devices() else { return };
+            let Some(dev) = devs.iter().next() else { return };
+            dev
+        };
+        tokio::spawn(async move {
+            let _ = connect(&dev, 0, &[]).await;
+        });
     }
 }
