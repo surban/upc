@@ -301,8 +301,8 @@ impl UpcFunction {
 
             if do_halt {
                 tracing::debug!("halting endpoints");
-                ep_tx.lock().await.control()?.halt()?;
-                ep_rx.lock().await.control()?.halt()?;
+                let _ = ep_tx.lock().await.control()?.halt();
+                let _ = ep_rx.lock().await.control()?.halt();
                 do_halt = false;
             }
 
