@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## 0.2.4 - 2023-11-03
+### Fixed
+- flush connection properly when connecting
+
 ## 0.2.3 - 2023-11-03
 ### Fixed
 - ignore endpoint halt failure
