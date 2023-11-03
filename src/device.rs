@@ -286,24 +286,20 @@ impl UpcFunction {
         let mut in_task = future::pending().boxed();
         let mut out_task = future::pending().boxed();
 
-        let mut do_stop = false;
         let mut do_halt = false;
+        let mut is_open = false;
 
         loop {
-            if do_stop || do_halt {
-                tracing::debug!("canceling endpoint transfers");
+            if do_halt {
+                tracing::debug!("halting endpoints");
                 in_task = future::pending().boxed();
                 out_task = future::pending().boxed();
                 ep_tx.lock().await.cancel()?;
                 ep_rx.lock().await.cancel()?;
-                do_stop = false;
-            }
-
-            if do_halt {
-                tracing::debug!("halting endpoints");
                 let _ = ep_tx.lock().await.control()?.halt();
                 let _ = ep_rx.lock().await.control()?.halt();
                 do_halt = false;
+                is_open = false;
             }
 
             tokio::select! {
@@ -325,7 +321,11 @@ impl UpcFunction {
 
                         Event::Disable => {
                             tracing::debug!("device disabled");
-                            do_stop = true;
+                            in_task = future::pending().boxed();
+                            out_task = future::pending().boxed();
+                            ep_tx.lock().await.cancel()?;
+                            ep_rx.lock().await.cancel()?;
+                            is_open = false;
                         }
 
                         Event::SetupHostToDevice(req) => {
@@ -334,15 +334,27 @@ impl UpcFunction {
                             match ctrl_req.request {
                                 CTRL_REQ_OPEN => {
                                     tracing::debug!("open connection request");
+
+                                    if is_open {
+                                        tracing::debug!("closing previous connection");
+                                        in_task = future::pending().boxed();
+                                        out_task = future::pending().boxed();
+                                        ep_tx.lock().await.cancel()?;
+                                        ep_rx.lock().await.cancel()?;
+                                    }
+
                                     // WORKAROUND: some UDCs fail the first incoming transfer when no
                                     //             receive buffers are enqueued.
                                     while ep_rx.lock().await.try_recv(max_packet_size).is_ok() {}
+
                                     match req.recv_all() {
                                         Ok(topic) => {
                                             let (ctx, crx, Head { tx, rx }) = connection(topic, max_packet_size);
                                             let _ = conn_tx.send((ctx, crx)).await;
                                             in_task = Self::in_task(&ep_rx, tx).boxed();
                                             out_task = Self::out_task(&ep_tx, rx).boxed();
+                                            is_open = true;
+                                            tracing::debug!("connection established");
                                         }
                                         Err(err) => {
                                             tracing::warn!("topic receive error: {err}");
@@ -350,13 +362,19 @@ impl UpcFunction {
                                         }
                                     }
                                 }
+
                                 CTRL_REQ_CLOSE => {
                                     tracing::debug!("close connection request");
+                                    in_task = future::pending().boxed();
+                                    out_task = future::pending().boxed();
+                                    ep_tx.lock().await.cancel()?;
+                                    ep_rx.lock().await.cancel()?;
                                     if let Err(err) = req.recv_all() {
                                         tracing::warn!("close request receive error: {err}");
                                     }
-                                    do_stop = true;
+                                    is_open = false;
                                 }
+
                                 other => tracing::warn!("unknown control request {other:x}"),
                             }
                         }

@@ -204,6 +204,7 @@ pub async fn connect<C: UsbContext + 'static>(
         }
     }
     let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else { return Err(Error::NotFound) };
+    let max_transfer_size = max_packet_size * 128;
 
     // Open device and claim interface.
     let mut hnd = dev.open()?;
@@ -217,7 +218,17 @@ pub async fn connect<C: UsbContext + 'static>(
     let hnd_task = hnd.clone();
     let topic = topic.to_vec();
     spawn_blocking(move || {
-        hnd_task.write_control(OUT_REQUEST, CTRL_REQ_OPEN, 0, interface.into(), &topic, TIMEOUT)
+        // Close previous connection and flush buffer.
+        let mut buf = vec![0; max_transfer_size];
+        hnd_task.write_control(OUT_REQUEST, CTRL_REQ_CLOSE, 0, interface.into(), &[], TIMEOUT)?;
+        while let Ok(n) = hnd_task.read_bulk(ep_in, &mut buf, Duration::from_millis(10)) {
+            if n == 0 {
+                break;
+            }
+        }
+
+        hnd_task.write_control(OUT_REQUEST, CTRL_REQ_OPEN, 0, interface.into(), &topic, TIMEOUT)?;
+        Ok(())
     })
     .await
     .unwrap()?;
@@ -232,7 +243,6 @@ pub async fn connect<C: UsbContext + 'static>(
     let error_in = error.clone();
     let (tx_in, rx_in) = mpsc::channel(16);
     let in_closed = closed.clone();
-    let max_transfer_size = max_packet_size * 128;
     let in_thread = thread::Builder::new()
         .name(format!("UPC {name} in"))
         .spawn(move || in_thread(hnd_in, tx_in, ep_in, interface, error_in, max_transfer_size, in_closed))
