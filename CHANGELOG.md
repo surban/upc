@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## 0.3.0 - 2023-11-07
+### Added
+- Sink and Stream wrappers
+### Changed
+- host errors are now std::io::Error
+
 ## 0.2.4 - 2023-11-03
 ### Fixed
 - flush connection properly when connecting
