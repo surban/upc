@@ -4,6 +4,7 @@
 //! Pass the returned handle to the [`usb_gadget`] library to expose the USB gadget.
 //!
 
+use bytes::{Bytes, BytesMut};
 use futures_util::{future, FutureExt};
 use std::{
     fmt,
@@ -30,7 +31,7 @@ use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_
 
 /// Sends data into a USB packet channel.
 pub struct UpcSender {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Bytes>,
 }
 
 impl fmt::Debug for UpcSender {
@@ -44,7 +45,7 @@ impl UpcSender {
     ///
     /// ## Cancel safety
     /// If canceled, no data will have been sent.
-    pub async fn send(&self, data: Vec<u8>) -> Result<()> {
+    pub async fn send(&self, data: Bytes) -> Result<()> {
         self.tx.send(data).await.map_err(|_| Error::new(ErrorKind::ConnectionReset, "connection closed"))
     }
 
@@ -58,8 +59,8 @@ impl UpcSender {
 /// Receives data from a USB packet channel.
 pub struct UpcReceiver {
     topic: Vec<u8>,
-    rx: mpsc::Receiver<Vec<u8>>,
-    buffer: Vec<u8>,
+    rx: mpsc::Receiver<BytesMut>,
+    buffer: BytesMut,
     max_size: usize,
     max_packet_size: usize,
 }
@@ -80,14 +81,15 @@ impl UpcReceiver {
     ///
     /// ## Cancel safety
     /// If canceled, no data will have been removed from the receive queue.
-    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+    pub async fn recv(&mut self) -> Result<BytesMut> {
         loop {
             let packet = self
                 .rx
                 .recv()
                 .await
                 .ok_or_else(|| Error::new(ErrorKind::ConnectionReset, "connection closed"))?;
-            self.buffer.extend_from_slice(&packet);
+            let packet_len = packet.len();
+            self.buffer.unsplit(packet);
 
             if self.buffer.len() > self.max_size {
                 self.buffer.clear();
@@ -97,7 +99,7 @@ impl UpcReceiver {
                 ));
             }
 
-            if packet.len() < self.max_packet_size {
+            if packet_len < self.max_packet_size {
                 return Ok(take(&mut self.buffer));
             }
         }
@@ -115,15 +117,15 @@ impl UpcReceiver {
 }
 
 struct Head {
-    tx: mpsc::Sender<Vec<u8>>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    tx: mpsc::Sender<BytesMut>,
+    rx: mpsc::Receiver<Bytes>,
 }
 
 fn connection(topic: Vec<u8>, max_packet_size: usize) -> (UpcSender, UpcReceiver, Head) {
     let (tx_in, rx_in) = mpsc::channel(32);
     let (tx_out, rx_out) = mpsc::channel(32);
     let sender = UpcSender { tx: tx_out };
-    let recv = UpcReceiver { topic, rx: rx_in, buffer: Vec::new(), max_size: MAX_SIZE, max_packet_size };
+    let recv = UpcReceiver { topic, rx: rx_in, buffer: BytesMut::new(), max_size: MAX_SIZE, max_packet_size };
     let head = Head { tx: tx_in, rx: rx_out };
     (sender, recv, head)
 }
@@ -235,12 +237,12 @@ impl UpcFunction {
         }
     }
 
-    async fn in_task(ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
+    async fn in_task(ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<BytesMut>) -> Result<()> {
         let mut ep_rx = ep_rx.lock().await;
         let max_packet_size = ep_rx.max_packet_size()?;
 
         while let Ok(permit) = tx.reserve().await {
-            if let Some(data) = ep_rx.recv_async(max_packet_size).await? {
+            if let Some(data) = ep_rx.recv_async(BytesMut::with_capacity(max_packet_size)).await? {
                 permit.send(data);
             }
         }
@@ -248,18 +250,16 @@ impl UpcFunction {
         Ok(())
     }
 
-    async fn out_task(ep_tx: &Mutex<EndpointSender>, mut rx: mpsc::Receiver<Vec<u8>>) -> Result<()> {
+    async fn out_task(ep_tx: &Mutex<EndpointSender>, mut rx: mpsc::Receiver<Bytes>) -> Result<()> {
         let mut ep_tx = ep_tx.lock().await;
         let max_packet_size = ep_tx.max_packet_size()?;
 
-        while let Some(data) = rx.recv().await {
-            let mut data = data.as_slice();
+        while let Some(mut data) = rx.recv().await {
             loop {
-                let part = &data[..data.len().min(max_packet_size)];
-                ep_tx.send_async(part.to_vec()).await?;
-                if part.len() == max_packet_size {
-                    data = &data[max_packet_size..];
-                } else {
+                let part = data.split_to(data.len().min(max_packet_size));
+                let part_len = part.len();
+                ep_tx.send_async(part).await?;
+                if part_len != max_packet_size {
                     break;
                 }
             }
@@ -345,7 +345,7 @@ impl UpcFunction {
 
                                     // WORKAROUND: some UDCs fail the first incoming transfer when no
                                     //             receive buffers are enqueued.
-                                    while ep_rx.lock().await.try_recv(max_packet_size).is_ok() {}
+                                    while ep_rx.lock().await.try_recv(BytesMut::with_capacity(max_packet_size)).is_ok() {}
 
                                     match req.recv_all() {
                                         Ok(topic) => {

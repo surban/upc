@@ -61,7 +61,7 @@ async fn main() {
     for n in 0..TEST_PACKETS {
         let data = tx_testdata.generate();
         let len = data.len();
-        tx.send(data).await.expect("send failed");
+        tx.send(data.into()).await.expect("send failed");
         total += len;
         tx_delay.delay().await;
 

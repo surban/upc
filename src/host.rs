@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::{Bytes, BytesMut};
 use rusb::{
     request_type, Device, DeviceHandle, Direction, Error, PrimaryLanguage, Recipient, RequestType, Result,
     SubLanguage, UsbContext,
@@ -85,7 +86,7 @@ pub fn info<C: UsbContext + 'static>(dev: &Device<C>, interface: u8) -> Result<V
 
 /// Sends data into a USB packet channel.
 pub struct UpcSender {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Bytes>,
     shared: Arc<UpcShared>,
 }
 
@@ -100,7 +101,7 @@ impl UpcSender {
     ///
     /// ## Cancel safety
     /// If canceled, no data will have been sent.
-    pub async fn send(&self, data: Vec<u8>) -> Result<()> {
+    pub async fn send(&self, data: Bytes) -> Result<()> {
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
             Err(_) => Err(*self.shared.error.lock().unwrap()),
@@ -116,9 +117,9 @@ impl UpcSender {
 
 /// Receives data from a USB packet channel.
 pub struct UpcReceiver {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<BytesMut>,
     shared: Arc<UpcShared>,
-    buffer: Vec<u8>,
+    buffer: BytesMut,
     max_size: usize,
     max_transfer_size: usize,
 }
@@ -134,17 +135,18 @@ impl UpcReceiver {
     ///
     /// ## Cancel safety
     /// If canceled, no data will have been removed from the receive queue.
-    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+    pub async fn recv(&mut self) -> Result<BytesMut> {
         loop {
             let packet = self.rx.recv().await.ok_or(Error::Pipe)?;
-            self.buffer.extend_from_slice(&packet);
+            let packet_len = packet.len();
+            self.buffer.unsplit(packet);
 
             if self.buffer.len() > self.max_size {
                 self.buffer.clear();
                 return Err(Error::Overflow);
             }
 
-            if packet.len() < self.max_transfer_size {
+            if packet_len < self.max_transfer_size {
                 return Ok(take(&mut self.buffer));
             }
         }
@@ -265,17 +267,17 @@ pub async fn connect<C: UsbContext + 'static>(
         stop_tx: Some(stop_tx),
     });
     let sender = UpcSender { tx: tx_out, shared: shared.clone() };
-    let recv = UpcReceiver { rx: rx_in, shared, buffer: Vec::new(), max_size: MAX_SIZE, max_transfer_size };
+    let recv = UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: MAX_SIZE, max_transfer_size };
 
     Ok((sender, recv))
 }
 
 fn in_thread<C: UsbContext>(
-    hnd: Arc<DeviceHandle<C>>, tx: mpsc::Sender<Vec<u8>>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
+    hnd: Arc<DeviceHandle<C>>, tx: mpsc::Sender<BytesMut>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
     max_transfer_size: usize, closed: Arc<Mutex<bool>>,
 ) {
     while !tx.is_closed() {
-        let mut buf = vec![0; max_transfer_size];
+        let mut buf = BytesMut::zeroed(max_transfer_size);
         match hnd.read_bulk(ep, &mut buf, TIMEOUT) {
             Ok(n) => {
                 buf.truncate(n);
@@ -301,27 +303,26 @@ fn in_thread<C: UsbContext>(
 
 #[allow(clippy::too_many_arguments)]
 fn out_thread<C: UsbContext>(
-    hnd: Arc<DeviceHandle<C>>, mut rx: mpsc::Receiver<Vec<u8>>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
+    hnd: Arc<DeviceHandle<C>>, mut rx: mpsc::Receiver<Bytes>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
     mut stop_rx: oneshot::Receiver<()>, max_packet_size: usize, closed: Arc<Mutex<bool>>,
 ) {
-    'outer: while let Some(data) = rx.blocking_recv() {
-        let mut data = data.as_slice();
+    'outer: while let Some(mut data) = rx.blocking_recv() {
         loop {
             match stop_rx.try_recv() {
                 Err(TryRecvError::Empty) => (),
                 _ => break 'outer,
             }
 
-            match hnd.write_bulk(ep, data, TIMEOUT) {
+            match hnd.write_bulk(ep, &data, TIMEOUT) {
                 Ok(n) if n != data.len() => {
-                    data = &data[n..];
+                    let _ = data.split_to(n);
                 }
                 Ok(_) => {
                     if data.is_empty() || data.len() % max_packet_size != 0 {
                         break;
                     } else {
                         // Send zero length packet to indicate end of transfer.
-                        data = &[];
+                        data = Bytes::new();
                     }
                 }
                 Err(Error::Timeout) => (),

@@ -20,9 +20,10 @@ device = ["usb-gadget"]
 futures-util = "0.3"
 tokio = { version = "1.33", features = ["macros", "rt", "sync"] }
 rusb = { version = "0.9", optional = true }
-usb-gadget = { version = "0.4.1", features = ["tokio"], optional = true }
+usb-gadget = { version = "0.5", features = ["tokio"], optional = true }
 tracing = "0.1"
 uuid = "1"
+bytes = "1.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["time"] }
