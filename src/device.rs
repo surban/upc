@@ -5,11 +5,7 @@
 //!
 
 use bytes::{Bytes, BytesMut};
-use futures::{
-    future, sink,
-    stream::{self, BoxStream},
-    FutureExt, Sink, SinkExt, Stream, StreamExt,
-};
+use futures::{future, sink, stream, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use std::{
     fmt,
     future::Future,
@@ -169,12 +165,12 @@ impl UpcReceiver {
             }
         });
 
-        UpcStream(stream.boxed())
+        UpcStream(Box::pin(stream))
     }
 }
 
 /// Packet stream from a USB packet channel.
-pub struct UpcStream(BoxStream<'static, Result<BytesMut>>);
+pub struct UpcStream(Pin<Box<dyn Stream<Item = Result<BytesMut>> + Send + Sync + 'static>>);
 
 impl fmt::Debug for UpcStream {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

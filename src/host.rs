@@ -6,7 +6,7 @@
 //!
 
 use bytes::{Bytes, BytesMut};
-use futures::{sink, stream, stream::BoxStream, Sink, SinkExt, Stream, StreamExt};
+use futures::{sink, stream, Sink, SinkExt, Stream, StreamExt};
 use rusb::{
     request_type, Device, DeviceHandle, Direction, PrimaryLanguage, Recipient, RequestType, SubLanguage,
     UsbContext,
@@ -235,12 +235,12 @@ impl UpcReceiver {
             }
         });
 
-        UpcStream(stream.boxed())
+        UpcStream(Box::pin(stream))
     }
 }
 
 /// Packet stream from a USB packet channel.
-pub struct UpcStream(BoxStream<'static, Result<BytesMut>>);
+pub struct UpcStream(Pin<Box<dyn Stream<Item = Result<BytesMut>> + Send + Sync + 'static>>);
 
 impl fmt::Debug for UpcStream {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
