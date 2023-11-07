@@ -5,27 +5,32 @@
 //!
 
 use bytes::{Bytes, BytesMut};
-use futures_util::{future, FutureExt};
+use futures::{
+    future, sink,
+    stream::{self, BoxStream},
+    FutureExt, Sink, SinkExt, Stream, StreamExt,
+};
 use std::{
     fmt,
     future::Future,
     io::{Error, ErrorKind, Result},
     mem::take,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
 };
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
 };
-use usb_gadget::function::custom::OsExtProp;
-use uuid::Uuid;
-
 use usb_gadget::function::{
     custom::{
         Custom, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface, OsExtCompat,
+        OsExtProp,
     },
     Handle,
 };
+use uuid::Uuid;
 
 use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
 
@@ -53,6 +58,45 @@ impl UpcSender {
     pub fn closed(&self) -> impl Future<Output = ()> {
         let tx = self.tx.clone();
         async move { tx.closed().await }
+    }
+
+    /// Turns this into a sink for packets.
+    pub fn into_sink(self) -> UpcSink {
+        let sink = sink::unfold(self, |this, data: Bytes| async move {
+            this.send(data).await?;
+            Ok(this)
+        });
+
+        UpcSink(Box::pin(sink))
+    }
+}
+
+/// Packet sink into a USB packet channel.
+pub struct UpcSink(Pin<Box<dyn Sink<Bytes, Error = Error> + Send + Sync + 'static>>);
+
+impl fmt::Debug for UpcSink {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("UpcSink").finish()
+    }
+}
+
+impl Sink<Bytes> for UpcSink {
+    type Error = Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        Pin::into_inner(self).0.poll_ready_unpin(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<()> {
+        Pin::into_inner(self).0.start_send_unpin(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        Pin::into_inner(self).0.poll_flush_unpin(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        Pin::into_inner(self).0.poll_close_unpin(cx)
     }
 }
 
@@ -113,6 +157,36 @@ impl UpcReceiver {
     /// Sets the maximum receive packet size.
     pub fn set_max_size(&mut self, max_size: usize) {
         self.max_size = max_size;
+    }
+
+    /// Turns this into a stream of packets.
+    pub fn into_stream(self) -> UpcStream {
+        let stream = stream::try_unfold(self, |mut this| async move {
+            match this.recv().await {
+                Ok(data) => Ok(Some((data, this))),
+                Err(err) if err.kind() == ErrorKind::ConnectionReset => Ok(None),
+                Err(err) => Err(Error::new(ErrorKind::ConnectionReset, err)),
+            }
+        });
+
+        UpcStream(stream.boxed())
+    }
+}
+
+/// Packet stream from a USB packet channel.
+pub struct UpcStream(BoxStream<'static, Result<BytesMut>>);
+
+impl fmt::Debug for UpcStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("UpcStream").finish()
+    }
+}
+
+impl Stream for UpcStream {
+    type Item = Result<BytesMut>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        Pin::into_inner(self).0.poll_next_unpin(cx)
     }
 }
 

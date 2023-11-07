@@ -17,7 +17,7 @@ host = ["rusb"]
 device = ["usb-gadget"]
 
 [dependencies]
-futures-util = "0.3"
+futures = "0.3"
 tokio = { version = "1.33", features = ["macros", "rt", "sync"] }
 rusb = { version = "0.9", optional = true }
 usb-gadget = { version = "0.5", features = ["tokio"], optional = true }

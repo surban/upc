@@ -2,20 +2,25 @@
 //!
 //! To open a channel, use [`rusb`] to find the target device and then pass it to [`connect`].
 //!
+//! All errors returned from this module have an inner error type of [`rusb::Error`].
+//!
 
+use bytes::{Bytes, BytesMut};
+use futures::{sink, stream, stream::BoxStream, Sink, SinkExt, Stream, StreamExt};
+use rusb::{
+    request_type, Device, DeviceHandle, Direction, PrimaryLanguage, Recipient, RequestType, SubLanguage,
+    UsbContext,
+};
 use std::{
     fmt,
     future::Future,
+    io::{Error, ErrorKind, Result},
     mem::take,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     thread::{self, JoinHandle},
     time::Duration,
-};
-
-use bytes::{Bytes, BytesMut};
-use rusb::{
-    request_type, Device, DeviceHandle, Direction, Error, PrimaryLanguage, Recipient, RequestType, Result,
-    SubLanguage, UsbContext,
 };
 use tokio::{
     sync::{mpsc, oneshot, oneshot::error::TryRecvError},
@@ -29,12 +34,33 @@ const OUT_REQUEST: u8 = request_type(Direction::Out, RequestType::Vendor, Recipi
 
 const TIMEOUT: Duration = Duration::from_secs(1);
 
+fn to_io_err(error: rusb::Error) -> Error {
+    let kind = match error {
+        rusb::Error::Io => ErrorKind::ConnectionAborted,
+        rusb::Error::InvalidParam => ErrorKind::InvalidInput,
+        rusb::Error::Access => ErrorKind::PermissionDenied,
+        rusb::Error::NoDevice => ErrorKind::NotFound,
+        rusb::Error::NotFound => ErrorKind::NotFound,
+        rusb::Error::Busy => ErrorKind::AddrInUse,
+        rusb::Error::Timeout => ErrorKind::TimedOut,
+        rusb::Error::Overflow => ErrorKind::OutOfMemory,
+        rusb::Error::Pipe => ErrorKind::BrokenPipe,
+        rusb::Error::Interrupted => ErrorKind::Interrupted,
+        rusb::Error::NoMem => ErrorKind::OutOfMemory,
+        rusb::Error::NotSupported => ErrorKind::Unsupported,
+        rusb::Error::BadDescriptor => ErrorKind::InvalidInput,
+        rusb::Error::Other => ErrorKind::Other,
+    };
+
+    Error::new(kind, error)
+}
+
 /// Finds the interface by class and optional interface name.
 ///
 /// Returns the interface number.
 pub fn find_interface<C: UsbContext>(dev: &Device<C>, class: Class, name: Option<impl AsRef<str>>) -> Result<u8> {
     let name = name.as_ref().map(|s| s.as_ref());
-    let cfg = dev.active_config_descriptor()?;
+    let cfg = dev.active_config_descriptor().map_err(to_io_err)?;
     for iface in cfg.interfaces() {
         for desc in iface.descriptors() {
             if desc.class_code() == class.class
@@ -53,17 +79,18 @@ pub fn find_interface<C: UsbContext>(dev: &Device<C>, class: Class, name: Option
             }
         }
     }
-    Err(Error::NotFound)
+
+    Err(Error::new(ErrorKind::NotFound, rusb::Error::NotFound))
 }
 
-fn read_string<C: UsbContext>(dev: &Device<C>, idx: u8) -> Result<String> {
+fn read_string<C: UsbContext>(dev: &Device<C>, idx: u8) -> rusb::Result<String> {
     let hnd = dev.open()?;
     let langs = hnd.read_languages(TIMEOUT)?;
     match langs.into_iter().find(|lang| {
         lang.primary_language() == PrimaryLanguage::English && lang.sub_language() == SubLanguage::UnitedStates
     }) {
         Some(lang) => hnd.read_string_descriptor(lang, idx, TIMEOUT),
-        None => Err(Error::NotFound),
+        None => Err(rusb::Error::NotFound),
     }
 }
 
@@ -72,13 +99,15 @@ fn read_string<C: UsbContext>(dev: &Device<C>, idx: u8) -> Result<String> {
 /// The maximum size of the data is [`INFO_SIZE`].
 pub fn info<C: UsbContext + 'static>(dev: &Device<C>, interface: u8) -> Result<Vec<u8>> {
     // Open device and claim interface.
-    let mut hnd = dev.open()?;
-    hnd.claim_interface(interface)?;
+    let mut hnd = dev.open().map_err(to_io_err)?;
+    hnd.claim_interface(interface).map_err(to_io_err)?;
 
     // Read info.
     tracing::debug!("reading info");
     let mut info = vec![0; INFO_SIZE];
-    let n = hnd.read_control(IN_REQUEST, CTRL_REQ_INFO, 0, interface.into(), &mut info, TIMEOUT)?;
+    let n = hnd
+        .read_control(IN_REQUEST, CTRL_REQ_INFO, 0, interface.into(), &mut info, TIMEOUT)
+        .map_err(to_io_err)?;
     info.truncate(n);
 
     Ok(info)
@@ -104,7 +133,7 @@ impl UpcSender {
     pub async fn send(&self, data: Bytes) -> Result<()> {
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
-            Err(_) => Err(*self.shared.error.lock().unwrap()),
+            Err(_) => Err(*self.shared.error.lock().unwrap()).map_err(to_io_err),
         }
     }
 
@@ -112,6 +141,45 @@ impl UpcSender {
     pub fn closed(&self) -> impl Future<Output = ()> {
         let tx = self.tx.clone();
         async move { tx.closed().await }
+    }
+
+    /// Turns this into a sink for packets.
+    pub fn into_sink(self) -> UpcSink {
+        let sink = sink::unfold(self, |this, data: Bytes| async move {
+            this.send(data).await?;
+            Ok(this)
+        });
+
+        UpcSink(Box::pin(sink))
+    }
+}
+
+/// Packet sink into a USB packet channel.
+pub struct UpcSink(Pin<Box<dyn Sink<Bytes, Error = Error> + Send + Sync + 'static>>);
+
+impl fmt::Debug for UpcSink {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("UpcSink").finish()
+    }
+}
+
+impl Sink<Bytes> for UpcSink {
+    type Error = Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        Pin::into_inner(self).0.poll_ready_unpin(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<()> {
+        Pin::into_inner(self).0.start_send_unpin(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        Pin::into_inner(self).0.poll_flush_unpin(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
+        Pin::into_inner(self).0.poll_close_unpin(cx)
     }
 }
 
@@ -137,13 +205,13 @@ impl UpcReceiver {
     /// If canceled, no data will have been removed from the receive queue.
     pub async fn recv(&mut self) -> Result<BytesMut> {
         loop {
-            let packet = self.rx.recv().await.ok_or(Error::Pipe)?;
+            let packet = self.rx.recv().await.ok_or(rusb::Error::Pipe).map_err(to_io_err)?;
             let packet_len = packet.len();
             self.buffer.unsplit(packet);
 
             if self.buffer.len() > self.max_size {
                 self.buffer.clear();
-                return Err(Error::Overflow);
+                return Err(rusb::Error::Overflow).map_err(to_io_err);
             }
 
             if packet_len < self.max_transfer_size {
@@ -156,11 +224,41 @@ impl UpcReceiver {
     pub fn set_max_size(&mut self, max_size: usize) {
         self.max_size = max_size;
     }
+
+    /// Turns this into a stream of packets.
+    pub fn into_stream(self) -> UpcStream {
+        let stream = stream::try_unfold(self, |mut this| async move {
+            match this.recv().await {
+                Ok(data) => Ok(Some((data, this))),
+                Err(err) if err.kind() == ErrorKind::ConnectionReset => Ok(None),
+                Err(err) => Err(Error::new(ErrorKind::ConnectionReset, err)),
+            }
+        });
+
+        UpcStream(stream.boxed())
+    }
+}
+
+/// Packet stream from a USB packet channel.
+pub struct UpcStream(BoxStream<'static, Result<BytesMut>>);
+
+impl fmt::Debug for UpcStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("UpcStream").finish()
+    }
+}
+
+impl Stream for UpcStream {
+    type Item = Result<BytesMut>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        Pin::into_inner(self).0.poll_next_unpin(cx)
+    }
 }
 
 struct UpcShared {
     name: String,
-    error: Arc<Mutex<Error>>,
+    error: Arc<Mutex<rusb::Error>>,
     in_thread: Option<JoinHandle<()>>,
     out_thread: Option<JoinHandle<()>>,
     stop_tx: Option<oneshot::Sender<()>>,
@@ -193,8 +291,9 @@ pub async fn connect<C: UsbContext + 'static>(
     let mut ep_out = None;
     let mut max_packet_size = usize::MAX;
     {
-        let cfg = dev.active_config_descriptor()?;
-        let iface_desc = cfg.interfaces().find(|i| i.number() == interface).ok_or(Error::NotFound)?;
+        let cfg = dev.active_config_descriptor().map_err(to_io_err)?;
+        let iface_desc =
+            cfg.interfaces().find(|i| i.number() == interface).ok_or(rusb::Error::NotFound).map_err(to_io_err)?;
         for desc in iface_desc.descriptors() {
             for ep in desc.endpoint_descriptors() {
                 max_packet_size = max_packet_size.min(ep.max_packet_size().into());
@@ -205,14 +304,16 @@ pub async fn connect<C: UsbContext + 'static>(
             }
         }
     }
-    let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else { return Err(Error::NotFound) };
+    let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
+        return Err(rusb::Error::NotFound).map_err(to_io_err);
+    };
     let max_transfer_size = max_packet_size * 128;
 
     // Open device and claim interface.
-    let mut hnd = dev.open()?;
-    hnd.claim_interface(interface)?;
-    hnd.clear_halt(ep_in)?;
-    hnd.clear_halt(ep_out)?;
+    let mut hnd = dev.open().map_err(to_io_err)?;
+    hnd.claim_interface(interface).map_err(to_io_err)?;
+    hnd.clear_halt(ep_in).map_err(to_io_err)?;
+    hnd.clear_halt(ep_out).map_err(to_io_err)?;
     let hnd = Arc::new(hnd);
 
     // Open connection.
@@ -233,11 +334,12 @@ pub async fn connect<C: UsbContext + 'static>(
         Ok(())
     })
     .await
-    .unwrap()?;
+    .unwrap()
+    .map_err(to_io_err)?;
     tracing::debug!("connection is open");
 
     // Start handler threads.
-    let error = Arc::new(Mutex::new(Error::Pipe));
+    let error = Arc::new(Mutex::new(rusb::Error::Pipe));
     let name = format!("{}-{}:{}", dev.bus_number(), dev.address(), interface);
     let closed = Arc::new(Mutex::new(false));
 
@@ -273,7 +375,7 @@ pub async fn connect<C: UsbContext + 'static>(
 }
 
 fn in_thread<C: UsbContext>(
-    hnd: Arc<DeviceHandle<C>>, tx: mpsc::Sender<BytesMut>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
+    hnd: Arc<DeviceHandle<C>>, tx: mpsc::Sender<BytesMut>, ep: u8, iface: u8, error: Arc<Mutex<rusb::Error>>,
     max_transfer_size: usize, closed: Arc<Mutex<bool>>,
 ) {
     while !tx.is_closed() {
@@ -285,7 +387,7 @@ fn in_thread<C: UsbContext>(
                     break;
                 }
             }
-            Err(Error::Timeout) => (),
+            Err(rusb::Error::Timeout) => (),
             Err(err) => {
                 tracing::warn!("receiving failed: {err}");
                 *error.lock().unwrap() = err;
@@ -303,7 +405,7 @@ fn in_thread<C: UsbContext>(
 
 #[allow(clippy::too_many_arguments)]
 fn out_thread<C: UsbContext>(
-    hnd: Arc<DeviceHandle<C>>, mut rx: mpsc::Receiver<Bytes>, ep: u8, iface: u8, error: Arc<Mutex<Error>>,
+    hnd: Arc<DeviceHandle<C>>, mut rx: mpsc::Receiver<Bytes>, ep: u8, iface: u8, error: Arc<Mutex<rusb::Error>>,
     mut stop_rx: oneshot::Receiver<()>, max_packet_size: usize, closed: Arc<Mutex<bool>>,
 ) {
     'outer: while let Some(mut data) = rx.blocking_recv() {
@@ -325,7 +427,7 @@ fn out_thread<C: UsbContext>(
                         data = Bytes::new();
                     }
                 }
-                Err(Error::Timeout) => (),
+                Err(rusb::Error::Timeout) => (),
                 Err(err) => {
                     tracing::warn!("sending failed: {err}");
                     *error.lock().unwrap() = err;
