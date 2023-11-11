@@ -11,6 +11,7 @@ use std::{
     future::Future,
     io::{Error, ErrorKind, Result},
     mem::take,
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -21,8 +22,8 @@ use tokio::{
 };
 use usb_gadget::function::{
     custom::{
-        Custom, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface, OsExtCompat,
-        OsExtProp,
+        Custom, CustomBuilder, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface,
+        OsExtCompat, OsExtProp,
     },
     Handle,
 };
@@ -260,6 +261,19 @@ impl UpcFunction {
     /// [`usb_gadget::Config::with_function`] to include the interface in your
     /// USB gadget.
     pub fn new(interface_id: InterfaceId) -> (Self, Handle) {
+        Self::init(interface_id, |builder| Ok(builder.build())).unwrap()
+    }
+
+    /// Creates a new USB packet device-side interface with the specified interface identification
+    /// using the provided FunctionFS directory.
+    pub fn with_ffs(interface_id: InterfaceId, ffs_dir: impl AsRef<Path>) -> Result<Self> {
+        let (this, ()) = Self::init(interface_id, |builder| Ok((builder.existing(ffs_dir)?, ())))?;
+        Ok(this)
+    }
+
+    fn init<T>(
+        interface_id: InterfaceId, build_fn: impl FnOnce(CustomBuilder) -> Result<(Custom, T)>,
+    ) -> Result<(Self, T)> {
         let (ep_rx, ep_rx_dir) = EndpointDirection::host_to_device();
         let (ep_tx, ep_tx_dir) = EndpointDirection::device_to_host();
 
@@ -271,7 +285,8 @@ impl UpcFunction {
             interface = interface.with_os_ext_prop(OsExtProp::device_interface_guid(guid));
         }
 
-        let (ep0, handle) = Custom::builder().with_interface(interface).build();
+        let builder = Custom::builder().with_interface(interface);
+        let (ep0, ret) = build_fn(builder)?;
 
         let (conn_tx, conn_rx) = mpsc::channel(4);
         let info = Arc::new(Mutex::new(Vec::new()));
@@ -279,7 +294,7 @@ impl UpcFunction {
         let mut task = JoinSet::new();
         task.spawn(Self::task(ep0, ep_tx, ep_rx, conn_tx, info.clone()));
 
-        (Self { class: interface_id.class, name: interface_id.name.to_string(), task, conn_rx, info }, handle)
+        Ok((Self { class: interface_id.class, name: interface_id.name.to_string(), task, conn_rx, info }, ret))
     }
 
     /// Sets the info data readable by host.
