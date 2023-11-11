@@ -12,7 +12,7 @@ use std::{
     io::{Error, ErrorKind, Result},
     mem::take,
     path::Path,
-    pin::Pin,
+    pin::{pin, Pin},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -354,16 +354,24 @@ impl UpcFunction {
     }
 
     async fn task(
-        mut ep0: Custom, mut ep_tx: EndpointSender, ep_rx: EndpointReceiver,
+        mut ep0: Custom, ep_tx: EndpointSender, ep_rx: EndpointReceiver,
         conn_tx: mpsc::Sender<(UpcSender, UpcReceiver)>, info: Arc<Mutex<Vec<u8>>>,
     ) -> Result<()> {
         let status = ep0.status();
 
-        tracing::debug!("waiting for device bind");
-        status.bound().await?;
+        if let Some(status) = &status {
+            tracing::debug!("waiting for device bind");
+            status.bound().await?;
+        }
 
-        let max_packet_size = ep_tx.max_packet_size()?;
-        tracing::debug!("maximum packet size is {max_packet_size} bytes");
+        let mut unbound = pin!(async move {
+            match status {
+                Some(status) => status.unbound().await,
+                None => future::pending().await,
+            }
+        });
+
+        let mut max_packet_size = None;
 
         let ep_tx = Mutex::new(ep_tx);
         let ep_rx = Mutex::new(ep_rx);
@@ -388,7 +396,7 @@ impl UpcFunction {
             }
 
             tokio::select! {
-                () = status.unbound() => {
+                () = &mut unbound => {
                     tracing::debug!("device unbound");
                     break;
                 }
@@ -402,7 +410,11 @@ impl UpcFunction {
                     res?;
 
                     match ep0.event()? {
-                        Event::Enable => tracing::debug!("device enabled"),
+                        Event::Enable => {
+                            tracing::debug!("device enabled");
+                            max_packet_size = Some(ep_tx.lock().await.max_packet_size()?);
+                            tracing::debug!("maximum packet size is {} bytes", max_packet_size.unwrap());
+                        }
 
                         Event::Disable => {
                             tracing::debug!("device disabled");
@@ -411,6 +423,7 @@ impl UpcFunction {
                             ep_tx.lock().await.cancel()?;
                             ep_rx.lock().await.cancel()?;
                             is_open = false;
+                            max_packet_size = None;
                         }
 
                         Event::SetupHostToDevice(req) => {
@@ -430,11 +443,11 @@ impl UpcFunction {
 
                                     // WORKAROUND: some UDCs fail the first incoming transfer when no
                                     //             receive buffers are enqueued.
-                                    while ep_rx.lock().await.try_recv(BytesMut::with_capacity(max_packet_size)).is_ok() {}
+                                    while ep_rx.lock().await.try_recv(BytesMut::with_capacity(max_packet_size.unwrap())).is_ok() {}
 
                                     match req.recv_all() {
                                         Ok(topic) => {
-                                            let (ctx, crx, Head { tx, rx }) = connection(topic, max_packet_size);
+                                            let (ctx, crx, Head { tx, rx }) = connection(topic, max_packet_size.unwrap());
                                             let _ = conn_tx.send((ctx, crx)).await;
                                             in_task = Self::in_task(&ep_rx, tx).boxed();
                                             out_task = Self::out_task(&ep_tx, rx).boxed();
