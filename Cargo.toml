@@ -6,7 +6,7 @@ keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.73"
 autoexamples = false
@@ -20,7 +20,7 @@ device = ["usb-gadget"]
 futures = "0.3"
 tokio = { version = "1.33", features = ["macros", "rt", "sync"] }
 rusb = { version = "0.9", optional = true }
-usb-gadget = { version = "0.5", features = ["tokio"], optional = true }
+usb-gadget = { version = "0.6", features = ["tokio"], optional = true }
 tracing = "0.1"
 uuid = "1"
 bytes = "1.4"
