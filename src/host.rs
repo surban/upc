@@ -7,17 +7,15 @@
 
 use bytes::{Bytes, BytesMut};
 use futures::{sink, stream, Sink, SinkExt, Stream, StreamExt};
-use rusb::{
-    request_type, Device, DeviceHandle, Direction, PrimaryLanguage, Recipient, RequestType, SubLanguage,
-    UsbContext,
-};
+use rusb::{request_type, Device, DeviceHandle, Direction, Recipient, RequestType, UsbContext};
 use std::{
+    collections::HashSet,
     fmt,
     future::Future,
     io::{Error, ErrorKind, Result},
     mem::take,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     task::{Context, Poll},
     thread::{self, JoinHandle},
     time::Duration,
@@ -55,11 +53,10 @@ fn to_io_err(error: rusb::Error) -> Error {
     Error::new(kind, error)
 }
 
-/// Finds the interface by class and optional interface name.
+/// Finds the interface by interface class.
 ///
 /// Returns the interface number.
-pub fn find_interface<C: UsbContext>(dev: &Device<C>, class: Class, name: Option<impl AsRef<str>>) -> Result<u8> {
-    let name = name.as_ref().map(|s| s.as_ref());
+pub fn find_interface<C: UsbContext>(dev: &Device<C>, class: Class) -> Result<u8> {
     let cfg = dev.active_config_descriptor().map_err(to_io_err)?;
     for iface in cfg.interfaces() {
         for desc in iface.descriptors() {
@@ -67,14 +64,6 @@ pub fn find_interface<C: UsbContext>(dev: &Device<C>, class: Class, name: Option
                 && desc.sub_class_code() == class.sub_class
                 && desc.protocol_code() == class.protocol
             {
-                if let Some(name) = name {
-                    let Some(idx) = desc.description_string_index() else { continue };
-                    let Ok(if_name) = read_string(dev, idx) else { continue };
-                    if if_name != name {
-                        continue;
-                    }
-                }
-
                 return Ok(desc.interface_number());
             }
         }
@@ -83,23 +72,11 @@ pub fn find_interface<C: UsbContext>(dev: &Device<C>, class: Class, name: Option
     Err(Error::new(ErrorKind::NotFound, rusb::Error::NotFound))
 }
 
-fn read_string<C: UsbContext>(dev: &Device<C>, idx: u8) -> rusb::Result<String> {
-    let hnd = dev.open()?;
-    let langs = hnd.read_languages(TIMEOUT)?;
-    match langs.into_iter().find(|lang| {
-        lang.primary_language() == PrimaryLanguage::English && lang.sub_language() == SubLanguage::UnitedStates
-    }) {
-        Some(lang) => hnd.read_string_descriptor(lang, idx, TIMEOUT),
-        None => Err(rusb::Error::NotFound),
-    }
-}
-
 /// Read the device-provided information on the specified device and interface.
 ///
 /// The maximum size of the data is [`INFO_SIZE`].
-pub fn info<C: UsbContext + 'static>(dev: &Device<C>, interface: u8) -> Result<Vec<u8>> {
-    // Open device and claim interface.
-    let mut hnd = dev.open().map_err(to_io_err)?;
+pub fn info<C: UsbContext + 'static>(hnd: &DeviceHandle<C>, interface: u8) -> Result<Vec<u8>> {
+    // Claim interface.
     hnd.claim_interface(interface).map_err(to_io_err)?;
 
     // Read info.
@@ -256,6 +233,37 @@ impl Stream for UpcStream {
     }
 }
 
+static IN_USE: OnceLock<Mutex<HashSet<(usize, u8)>>> = OnceLock::new();
+fn in_use() -> MutexGuard<'static, HashSet<(usize, u8)>> {
+    IN_USE.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap()
+}
+
+struct InUseGuard {
+    handle: usize,
+    interface: u8,
+}
+
+impl InUseGuard {
+    fn new(handle: usize, interface: u8) -> Result<Self> {
+        let mut in_use = in_use();
+
+        if in_use.contains(&(handle, interface)) {
+            return Err(to_io_err(rusb::Error::Busy));
+        }
+
+        in_use.insert((handle, interface));
+
+        Ok(Self { handle, interface })
+    }
+}
+
+impl Drop for InUseGuard {
+    fn drop(&mut self) {
+        let mut in_use = in_use();
+        in_use.remove(&(self.handle, self.interface));
+    }
+}
+
 struct UpcShared {
     name: String,
     error: Arc<Mutex<rusb::Error>>,
@@ -282,9 +290,12 @@ impl Drop for UpcShared {
 /// # Panics
 /// Panics if the size of `topic` is larger than [`INFO_SIZE`].
 pub async fn connect<C: UsbContext + 'static>(
-    dev: &Device<C>, interface: u8, topic: &[u8],
+    hnd: Arc<DeviceHandle<C>>, interface: u8, topic: &[u8],
 ) -> Result<(UpcSender, UpcReceiver)> {
     assert!(topic.len() <= INFO_SIZE, "topic too big");
+
+    let guard = Arc::new(InUseGuard::new(hnd.as_raw() as _, interface)?);
+    let dev = hnd.device();
 
     // Get endpoints.
     let mut ep_in = None;
@@ -310,11 +321,9 @@ pub async fn connect<C: UsbContext + 'static>(
     let max_transfer_size = max_packet_size * 128;
 
     // Open device and claim interface.
-    let mut hnd = dev.open().map_err(to_io_err)?;
     hnd.claim_interface(interface).map_err(to_io_err)?;
     hnd.clear_halt(ep_in).map_err(to_io_err)?;
     hnd.clear_halt(ep_out).map_err(to_io_err)?;
-    let hnd = Arc::new(hnd);
 
     // Open connection.
     tracing::debug!("opening connection");
@@ -347,9 +356,13 @@ pub async fn connect<C: UsbContext + 'static>(
     let error_in = error.clone();
     let (tx_in, rx_in) = mpsc::channel(16);
     let in_closed = closed.clone();
+    let in_guard = guard.clone();
     let in_thread = thread::Builder::new()
         .name(format!("UPC {name} in"))
-        .spawn(move || in_thread(hnd_in, tx_in, ep_in, interface, error_in, max_transfer_size, in_closed))
+        .spawn(move || {
+            let _in_guard = in_guard;
+            in_thread(hnd_in, tx_in, ep_in, interface, error_in, max_transfer_size, in_closed)
+        })
         .unwrap();
 
     let (tx_out, rx_out) = mpsc::channel(16);
@@ -357,7 +370,10 @@ pub async fn connect<C: UsbContext + 'static>(
     let (stop_tx, stop_rx) = oneshot::channel();
     let out_thread = thread::Builder::new()
         .name(format!("UPC {name} out"))
-        .spawn(move || out_thread(hnd, rx_out, ep_out, interface, error_out, stop_rx, max_packet_size, closed))
+        .spawn(move || {
+            let _out_guard = guard;
+            out_thread(hnd, rx_out, ep_out, interface, error_out, stop_rx, max_packet_size, closed)
+        })
         .unwrap();
 
     // Build objects.
@@ -458,13 +474,14 @@ mod test {
     /// Verify that connect function is Send.
     #[tokio::test]
     async fn connect_is_send() {
-        let dev = {
+        let hnd = {
             let Ok(devs) = rusb::devices() else { return };
             let Some(dev) = devs.iter().next() else { return };
-            dev
+            let Ok(hnd) = dev.open() else { return };
+            Arc::new(hnd)
         };
         tokio::spawn(async move {
-            let _ = connect(&dev, 0, &[]).await;
+            let _ = connect(hnd, 0, &[]).await;
         });
     }
 }

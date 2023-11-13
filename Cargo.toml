@@ -6,7 +6,7 @@ keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.73"
 autoexamples = false
@@ -45,8 +45,9 @@ name = "device"
 required-features = ["device"]
 doc-scrape-examples = true
 
-# [patch.crates-io]
+[patch.crates-io]
 # usb-gadget = { path = "../usb-gadget" }
+rusb = { git = "https://github.com/surban/rusb.git" }
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,6 +1,9 @@
 //! Host-side example.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::time::sleep;
 use upc::host::{connect, find_interface, info};
@@ -16,16 +19,17 @@ async fn main() {
     println!("Using device: {dev:?}");
 
     println!("Finding interface...");
-    let iface = find_interface(&dev, CLASS, Some(NAME)).expect("cannot find interface");
+    let iface = find_interface(&dev, CLASS).expect("cannot find interface");
     println!("Using interface {iface}");
 
     println!("Getting info...");
-    let info = info(&dev, iface).expect("cannot get info");
+    let hnd = dev.open().expect("cannot open device");
+    let info = info(&hnd, iface).expect("cannot get info");
     println!("Info: {}", String::from_utf8_lossy(&info));
     assert_eq!(info, INFO, "info mismatch");
 
     println!("Connecting...");
-    let (tx, mut rx) = connect(&dev, iface, TOPIC).await.expect("cannot connect");
+    let (tx, mut rx) = connect(Arc::new(hnd), iface, TOPIC).await.expect("cannot connect");
 
     let rx_task = tokio::spawn(async move {
         let mut rx_testdata = TestData::new(DEVICE_SEED, TEST_PACKET_MAX_SIZE);

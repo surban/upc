@@ -10,7 +10,6 @@ pub const VID: u16 = 4;
 pub const PID: u16 = 5;
 
 pub const CLASS: Class = Class::vendor_specific(22, 3);
-pub const NAME: &str = "USB-PACKET-TEST";
 pub const TOPIC: &[u8] = b"TEST TOPIC";
 pub const INFO: &[u8] = b"TEST INFO";
 

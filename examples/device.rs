@@ -24,7 +24,9 @@ async fn main() {
 
     println!("Creating UPC function...");
     let (mut upc, hnd) = UpcFunction::new(
-        InterfaceId::new(CLASS).with_name(NAME).with_guid(uuid!("3bf77270-42d2-42c6-a475-490227a9cc89")),
+        InterfaceId::new(CLASS)
+            .with_name("USB PACKET TEST")
+            .with_guid(uuid!("3bf77270-42d2-42c6-a475-490227a9cc89")),
     );
     upc.set_info(INFO.to_vec()).await;
 
