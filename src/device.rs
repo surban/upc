@@ -328,6 +328,8 @@ impl UpcFunction {
 
         while let Ok(permit) = tx.reserve().await {
             if let Some(data) = ep_rx.recv_async(BytesMut::with_capacity(max_packet_size)).await? {
+                #[cfg(feature = "trace-packets")]
+                tracing::trace!("Received packet of {} bytes", data.len());
                 permit.send(data);
             }
         }
@@ -344,6 +346,8 @@ impl UpcFunction {
                 let part = data.split_to(data.len().min(max_packet_size));
                 let part_len = part.len();
                 ep_tx.send_async(part).await?;
+                #[cfg(feature = "trace-packets")]
+                tracing::trace!("Sent packet of {part_len} bytes");
                 if part_len != max_packet_size {
                     break;
                 }

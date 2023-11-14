@@ -398,6 +398,8 @@ fn in_thread<C: UsbContext>(
         let mut buf = BytesMut::zeroed(max_transfer_size);
         match hnd.read_bulk(ep, &mut buf, TIMEOUT) {
             Ok(n) => {
+                #[cfg(feature = "trace-packets")]
+                tracing::trace!("Received packet of {n} bytes");
                 buf.truncate(n);
                 if tx.blocking_send(buf).is_err() {
                     break;
@@ -433,9 +435,13 @@ fn out_thread<C: UsbContext>(
 
             match hnd.write_bulk(ep, &data, TIMEOUT) {
                 Ok(n) if n != data.len() => {
+                    #[cfg(feature = "trace-packets")]
+                    tracing::trace!("Sent packet of {n} bytes");
                     let _ = data.split_to(n);
                 }
                 Ok(_) => {
+                    #[cfg(feature = "trace-packets")]
+                    tracing::trace!("Sent packet of {} bytes", data.len());
                     if data.is_empty() || data.len() % max_packet_size != 0 {
                         break;
                     } else {
