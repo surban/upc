@@ -20,7 +20,7 @@ trace-packets = []
 [dependencies]
 futures = "0.3"
 tokio = { version = "1.33", features = ["macros", "rt", "sync"] }
-rusb = { version = "0.9", optional = true }
+rusb = { version = "0.9.3", optional = true }
 usb-gadget = { version = "0.6", features = ["tokio"], optional = true }
 tracing = "0.1"
 uuid = "1"
@@ -45,10 +45,6 @@ doc-scrape-examples = true
 name = "device"
 required-features = ["device"]
 doc-scrape-examples = true
-
-[patch.crates-io]
-# usb-gadget = { path = "../usb-gadget" }
-rusb = { git = "https://github.com/surban/rusb.git" }
 
 [package.metadata.docs.rs]
 all-features = true
