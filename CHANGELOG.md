@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## 0.5.0 - 2024-04-29
+### Added
+- feature trace-packets for debugging
+### Modified
+- accept shared rusb DeviceHandle
+- use usb-gadget version 0.7
+
 ## 0.4.0 - 2023-11-11
 ### Added
 - allow usage with existing FunctionFS mount

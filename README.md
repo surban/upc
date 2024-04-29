@@ -10,12 +10,14 @@ This library provides a reliable, packet-based transport over a physical USB con
 Features
 --------
 
-This crate provides the following features:
+This crate provides the following main features:
 
 * `host` enables the host-side part,
 * `device` enables the device-side part.
 
 To be useful, at least one of these features must be enabled.
+
+Additionally, the feature `trace-packets` can be enabled to log USB packets at log level trace.
 
 Requirements
 ------------
