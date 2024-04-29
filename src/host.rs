@@ -110,7 +110,7 @@ impl UpcSender {
     pub async fn send(&self, data: Bytes) -> Result<()> {
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
-            Err(_) => Err(*self.shared.error.lock().unwrap()).map_err(to_io_err),
+            Err(_) => Err(to_io_err(*self.shared.error.lock().unwrap())),
         }
     }
 
@@ -188,7 +188,7 @@ impl UpcReceiver {
 
             if self.buffer.len() > self.max_size {
                 self.buffer.clear();
-                return Err(rusb::Error::Overflow).map_err(to_io_err);
+                return Err(to_io_err(rusb::Error::Overflow));
             }
 
             if packet_len < self.max_transfer_size {
@@ -316,7 +316,7 @@ pub async fn connect<C: UsbContext + 'static>(
         }
     }
     let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
-        return Err(rusb::Error::NotFound).map_err(to_io_err);
+        return Err(to_io_err(rusb::Error::NotFound));
     };
     let max_transfer_size = max_packet_size * 128;
 
