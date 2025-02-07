@@ -70,7 +70,7 @@ impl TestData {
     pub fn generate(&mut self) -> Vec<u8> {
         let len = match self.pre_lengths.pop_front() {
             Some(len) => len,
-            None => self.rng.gen_range(0..self.max_length),
+            None => self.rng.random_range(0..self.max_length),
         };
         let mut data = vec![0; len];
         self.rng.fill_bytes(&mut data);
@@ -98,8 +98,8 @@ impl TestDelayer {
             return;
         }
 
-        if self.rng.gen_ratio(1, 1000) {
-            let ms = self.rng.gen_range(0..1000);
+        if self.rng.random_ratio(1, 1000) {
+            let ms = self.rng.random_range(0..1000);
             sleep(Duration::from_millis(ms)).await;
         }
     }
