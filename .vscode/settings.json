@@ -17,5 +17,7 @@
         "rusb",
         "UDCs"
     ],
-    "rust-analyzer.cargo.features": "all",
+    //"rust-analyzer.cargo.features": ["device", "host"],
+    "rust-analyzer.cargo.features": ["web"],
+    "rust-analyzer.cargo.target": "wasm32-unknown-unknown",
 }

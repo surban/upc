@@ -11,7 +11,7 @@
 #[cfg(feature = "device")]
 pub mod device;
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "web"))]
 pub mod host;
 
 /// Maximum info size.
@@ -53,11 +53,9 @@ impl From<Class> for usb_gadget::Class {
     }
 }
 
-#[cfg(any(feature = "host", feature = "device"))]
+#[allow(dead_code)]
 const CTRL_REQ_OPEN: u8 = 1;
-
-#[cfg(any(feature = "host", feature = "device"))]
+#[allow(dead_code)]
 const CTRL_REQ_CLOSE: u8 = 2;
-
-#[cfg(any(feature = "host", feature = "device"))]
+#[allow(dead_code)]
 const CTRL_REQ_INFO: u8 = 3;

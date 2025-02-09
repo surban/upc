@@ -1,8 +1,6 @@
 use rand::prelude::*;
 use rand_xoshiro::Xoshiro128StarStar;
-use std::{collections::VecDeque, sync::Once, time::Duration};
-use tokio::time::sleep;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use std::{collections::VecDeque, time::Duration};
 
 use upc::Class;
 
@@ -20,12 +18,33 @@ pub const TEST_PACKET_MAX_SIZE: usize = 1_000_000;
 
 pub const DELAY: bool = false;
 
+#[cfg(not(feature = "web"))]
 pub fn init_log() {
+    use std::sync::Once;
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
         tracing_log::LogTracer::init().unwrap();
     });
+}
+
+#[cfg(not(feature = "web"))]
+use tokio::time::sleep;
+
+#[cfg(feature = "web")]
+pub async fn sleep(duration: Duration) {
+    use js_sys::Promise;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::window;
+
+    let ms = duration.as_millis() as i32;
+    let promise = Promise::new(&mut |resolve, _reject| {
+        let window = window().unwrap();
+        window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms).unwrap();
+    });
+    JsFuture::from(promise).await.unwrap();
 }
 
 pub struct TestData {

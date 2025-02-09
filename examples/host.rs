@@ -24,7 +24,7 @@ async fn main() {
 
     println!("Getting info...");
     let hnd = dev.open().expect("cannot open device");
-    let info = info(&hnd, iface).expect("cannot get info");
+    let info = info(&hnd, iface).await.expect("cannot get info");
     println!("Info: {}", String::from_utf8_lossy(&info));
     assert_eq!(info, INFO, "info mismatch");
 
