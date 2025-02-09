@@ -12,7 +12,8 @@ Features
 
 This crate provides the following main features:
 
-* `host` enables the host-side part,
+* `host` enables the native host-side part,
+* `web` enables the web host-side part using WebUSB for device access and targeting WebAssembly,
 * `device` enables the device-side part.
 
 To be useful, at least one of these features must be enabled.
@@ -22,9 +23,9 @@ Additionally, the feature `trace-packets` can be enabled to log USB packets at l
 Requirements
 ------------
 
-The minimum support Rust version (MSRV) is 1.73.
+The minimum support Rust version (MSRV) is 1.80.
 
-The host-side part supports any operating system supported by `libusb`.
+The native host-side part supports any operating system supported by `libusb`.
 
 The device-side part requires Linux and a USB device controller (UDC).
 

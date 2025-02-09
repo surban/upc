@@ -1,14 +1,17 @@
-//! Host-side USB packet channel (UPC).
+#![allow(rustdoc::broken_intra_doc_links)]
+//! Host-side USB packet channel (UPC)
 //!
 //! ### Native platforms (crate feature `native`)
 //!
 //! To open a channel, use [`rusb`] to find the target device and then pass it to [`connect`].
 //!
-//! All errors returned from this module have an inner error type of [`rusb::Error`].
+//! Some errors from this module have an inner error type of [`rusb::Error`].
 //!
-//! ### Web platform (crate feature `web`)
+//! ### Web platform (crate feature `web` and targeting `wasm32-*`)
 //!
+//! To open a channel, use [`webusb_web`] to find the target device and then pass it to [`connect`].
 //!
+//! Some errors from this module have an inner error type of [`webusb_web::Error`].
 //!
 
 use bytes::{Bytes, BytesMut};

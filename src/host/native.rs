@@ -3,9 +3,8 @@
 use bytes::{Bytes, BytesMut};
 use rusb::{request_type, Device, DeviceHandle, Direction, Recipient, RequestType, UsbContext};
 use std::{
-    collections::HashSet,
     io::{Error, ErrorKind, Result},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::Duration,
 };

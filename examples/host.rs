@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::time::sleep;
+use tokio::{sync::oneshot, time::sleep};
 use upc::host::{connect, find_interface, info};
 
 mod common;
@@ -31,6 +31,7 @@ async fn main() {
     println!("Connecting...");
     let (tx, mut rx) = connect(Arc::new(hnd), iface, TOPIC).await.expect("cannot connect");
 
+    let (rx_task_done_tx, rx_task_done_rx) = oneshot::channel();
     let rx_task = tokio::spawn(async move {
         let mut rx_testdata = TestData::new(DEVICE_SEED, TEST_PACKET_MAX_SIZE);
         let mut rx_delay = TestDelayer::new(DEVICE_SEED);
@@ -49,6 +50,8 @@ async fn main() {
 
         let elapsed = start.elapsed().as_secs_f32();
         println!("Received {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f32 / elapsed / 1_048_576.);
+
+        rx_task_done_tx.send(()).unwrap();
 
         println!("Waiting for receiver close");
         rx.recv().await.expect_err("receiver not closed");
@@ -75,6 +78,7 @@ async fn main() {
     let elapsed = start.elapsed().as_secs_f32();
     println!("Sent {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f32 / elapsed / 1_048_576.);
 
+    rx_task_done_rx.await.unwrap();
     sleep(Duration::from_secs(1)).await;
 
     println!("Disconnecting...");

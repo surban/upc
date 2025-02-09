@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## 0.6.0 - 2025-02-10
+### Added
+- WebUSB support
+
 ## 0.5.0 - 2024-04-29
 ### Added
 - feature trace-packets for debugging

@@ -1,4 +1,4 @@
-//! # USB packet channel (UPC).
+//! # USB packet channel (UPC)
 //!
 //! This library provides a reliable, packet-based transport over a physical USB connection
 //! with an asynchronous API.

@@ -6,7 +6,7 @@ keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 autoexamples = false
@@ -58,7 +58,7 @@ required-features = ["device"]
 doc-scrape-examples = true
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["host", "device"]
 rustdoc-args = ["--cfg", "docsrs", "--cfg", "web_sys_unstable_apis"]
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 rustc-args = ["--cfg", "web_sys_unstable_apis"]

@@ -52,6 +52,7 @@ async fn web() {
     let (tx, mut rx) = connect(Rc::new(hnd), iface, TOPIC).await.expect_log("cannot connect");
 
     let (rx_task_done_tx, rx_task_done_rx) = oneshot::channel();
+    let (rx_task_finished_tx, rx_task_finished_rx) = oneshot::channel();
     spawn_local(async move {
         let mut rx_testdata = TestData::new(DEVICE_SEED, TEST_PACKET_MAX_SIZE);
         let mut rx_delay = TestDelayer::new(DEVICE_SEED);
@@ -71,11 +72,13 @@ async fn web() {
         let elapsed = (js_sys::Date::now() - start) / 1000.;
         log!("Received {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f64 / elapsed / 1_048_576.);
 
+        rx_task_done_tx.send(()).unwrap();
+
         log!("Waiting for receiver close");
         rx.recv().await.expect_err("receiver not closed");
         log!("Receiver closed");
 
-        rx_task_done_tx.send(()).unwrap();
+        rx_task_finished_tx.send(()).unwrap();
     });
 
     let mut tx_testdata = TestData::new(HOST_SEED, TEST_PACKET_MAX_SIZE);
@@ -98,8 +101,10 @@ async fn web() {
     let elapsed = (js_sys::Date::now() - start) / 1000.;
     log!("Sent {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f64 / elapsed / 1_048_576.);
 
+    rx_task_done_rx.await.unwrap();
+
     log!("Disconnecting...");
     drop(tx);
-    rx_task_done_rx.await.unwrap();
+    rx_task_finished_rx.await.unwrap();
     log!("Disconnected");
 }

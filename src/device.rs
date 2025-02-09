@@ -1,4 +1,4 @@
-//! Device-side USB packet channel (UPC).
+//! Device-side USB packet channel (UPC)
 //!
 //! Use [`UpcFunction::new`] to create an USB function that accepts incoming connections.
 //! Pass the returned handle to the [`usb_gadget`] library to expose the USB gadget.
