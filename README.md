@@ -13,12 +13,14 @@ Features
 This crate provides the following main features:
 
 * `host` enables the native host-side part,
-* `web` enables the web host-side part using WebUSB for device access and targeting WebAssembly,
+* `web` enables the web host-side part using [WebUSB] for device access and targeting WebAssembly,
 * `device` enables the device-side part.
 
 To be useful, at least one of these features must be enabled.
 
 Additionally, the feature `trace-packets` can be enabled to log USB packets at log level trace.
+
+[WebUSB]: https://developer.mozilla.org/en-US/docs/Web/API/WebUSB_API
 
 Requirements
 ------------

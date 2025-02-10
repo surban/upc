@@ -6,9 +6,12 @@ use std::{
     io::{Error, ErrorKind, Result},
     rc::Rc,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, oneshot::error::TryRecvError};
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
+
 use webusb_web::{OpenUsbDevice, UsbControlRequest, UsbDevice, UsbDirection, UsbRecipient, UsbRequestType};
 
 use super::{UpcReceiver, UpcSender};
@@ -29,6 +32,22 @@ pub(crate) fn to_io_err(error: webusb_web::Error) -> Error {
     };
 
     Error::new(kind, error)
+}
+
+/// Sleep for the specified duration.
+async fn sleep(duration: Duration) {
+    let ms = duration.as_millis() as i32;
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let global = js_sys::global();
+        if let Some(window) = global.dyn_ref::<web_sys::Window>() {
+            window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms).unwrap();
+        } else if let Some(worker) = global.dyn_ref::<web_sys::WorkerGlobalScope>() {
+            worker.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms).unwrap();
+        } else {
+            panic!("unsupported global scope");
+        }
+    });
+    JsFuture::from(promise).await.unwrap();
 }
 
 /// Finds the interface by interface class.
@@ -139,13 +158,38 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
     );
     hnd.control_transfer_out(&control, &[]).await.map_err(to_io_err)?;
 
-    // // Flush buffer.
-    // let mut buf = vec![0; max_transfer_size];
-    // while let Ok(n) = hnd.read_bulk(ep_in, &mut buf, Duration::from_millis(10)) {
-    //     if n == 0 {
-    //         break;
-    //     }
-    // }
+    // Start handler tasks.
+    let error = Arc::new(Mutex::new(None));
+    let name = format!("{}:{}", dev.serial_number().unwrap_or_default(), interface);
+    let closed = Rc::new(Cell::new(false));
+
+    let hnd_in = hnd.clone();
+    let error_in = error.clone();
+    let (tx_in, mut rx_in) = mpsc::channel(16);
+    let in_closed = closed.clone();
+    let in_guard = guard.clone();
+    spawn_local(async move {
+        let _in_guard = in_guard;
+        in_task(hnd_in, tx_in, ep_in, interface, error_in, max_transfer_size, in_closed).await;
+    });
+
+    let hnd_out = hnd.clone();
+    let (tx_out, rx_out) = mpsc::channel(16);
+    let error_out = error.clone();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    spawn_local(async move {
+        let _out_guard = guard;
+        out_task(hnd_out, rx_out, ep_out, interface, error_out, stop_rx, max_packet_size, closed).await;
+    });
+
+    // Flush receive buffer.
+    loop {
+        tokio::select! {
+            biased;
+            Some(_) = rx_in.recv() => (),
+            () = sleep(Duration::from_millis(10)) => break,
+        }
+    }
 
     // Open connection.
     tracing::debug!("opening connection");
@@ -159,29 +203,6 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
     hnd.control_transfer_out(&control, topic).await.map_err(to_io_err)?;
     tracing::debug!("connection is open");
 
-    // Start handler tasks.
-    let error = Arc::new(Mutex::new(None));
-    let name = format!("{}:{}", dev.serial_number().unwrap_or_default(), interface);
-    let closed = Rc::new(Cell::new(false));
-
-    let hnd_in = hnd.clone();
-    let error_in = error.clone();
-    let (tx_in, rx_in) = mpsc::channel(16);
-    let in_closed = closed.clone();
-    let in_guard = guard.clone();
-    spawn_local(async move {
-        let _in_guard = in_guard;
-        in_task(hnd_in, tx_in, ep_in, interface, error_in, max_transfer_size, in_closed).await;
-    });
-
-    let (tx_out, rx_out) = mpsc::channel(16);
-    let error_out = error.clone();
-    let (stop_tx, stop_rx) = oneshot::channel();
-    spawn_local(async move {
-        let _out_guard = guard;
-        out_task(hnd, rx_out, ep_out, interface, error_out, stop_rx, max_packet_size, closed).await;
-    });
-
     // Build objects.
     let shared = Arc::new(UpcShared { name, error, stop_tx: Some(stop_tx) });
     let sender = UpcSender { tx: tx_out, shared: shared.clone() };
@@ -194,16 +215,21 @@ async fn in_task(
     hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<BytesMut>, ep: u8, iface: u8,
     error: Arc<Mutex<Option<webusb_web::Error>>>, max_transfer_size: usize, closed: Rc<Cell<bool>>,
 ) {
-    while !tx.is_closed() {
-        match hnd.transfer_in(ep, max_transfer_size as _).await {
+    loop {
+        let res = tokio::select! {
+            biased;
+            () = tx.closed() => break,
+            res = hnd.transfer_in(ep, max_transfer_size as _) => res,
+        };
+
+        match res {
             Ok(buf) => {
                 #[cfg(feature = "trace-packets")]
                 tracing::trace!("Received packet of {} bytes", buf.len());
-                if tx.blocking_send(Bytes::from(buf).into()).is_err() {
+                if tx.send(Bytes::from(buf).into()).await.is_err() {
                     break;
                 }
             }
-            //Err(rusb::Error::Timeout) => (),
             Err(err) => {
                 tracing::warn!("receiving failed: {err}");
                 *error.lock().unwrap() = Some(err);
@@ -246,7 +272,6 @@ async fn out_task(
                         data = Bytes::new();
                     }
                 }
-                // Err(rusb::Error::Timeout) => (),
                 Err(err) => {
                     tracing::warn!("sending failed: {err}");
                     *error.lock().unwrap() = Some(err);

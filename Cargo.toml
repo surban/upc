@@ -6,7 +6,7 @@ keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.80"
 autoexamples = false
@@ -15,7 +15,7 @@ autoexamples = false
 default = []
 host = ["dep:rusb", "tokio/rt"]
 device = ["dep:usb-gadget", "tokio/rt"]
-web = ["dep:webusb-web", "dep:wasm-bindgen-futures"]
+web = ["dep:js-sys", "dep:webusb-web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 trace-packets = []
 
 [dependencies]
@@ -27,8 +27,10 @@ tracing = "0.1"
 uuid = "1"
 bytes = "1.4"
 wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", features = ["Window", "WorkerGlobalScope"] }
 webusb-web = { version = "0.3", optional = true }
-getrandom = { version = "0.3", features = ["wasm_js"] }
+wasm-bindgen = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["time"] }
@@ -43,9 +45,7 @@ rand = "0.9"
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3"
-js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console", "Document", "HtmlElement"] }
-wasm-bindgen = "0.2"
 
 [[example]]
 name = "host"
