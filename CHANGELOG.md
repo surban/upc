@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## 0.7.0 - 2025-02-18
+### Changed
+- Update webusb-web to 0.4.0
 
 ## 0.6.0 - 2025-02-10
 ### Fixed
