@@ -6,9 +6,9 @@ keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.83"
 autoexamples = false
 
 [features]

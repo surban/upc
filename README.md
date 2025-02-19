@@ -25,7 +25,7 @@ Additionally, the feature `trace-packets` can be enabled to log USB packets at l
 Requirements
 ------------
 
-The minimum support Rust version (MSRV) is 1.80.
+The minimum support Rust version (MSRV) is 1.83.
 
 The native host-side part supports any operating system supported by `libusb`.
 
