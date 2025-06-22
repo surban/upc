@@ -20,7 +20,7 @@ trace-packets = []
 
 [dependencies]
 futures = "0.3"
-tokio = { version = "1.33", features = ["macros", "sync"] }
+tokio = { version = "1.43", features = ["macros", "sync"] }
 rusb = { version = "0.9.3", optional = true }
 usb-gadget = { version = "0.7", features = ["tokio"], optional = true }
 tracing = "0.1"
