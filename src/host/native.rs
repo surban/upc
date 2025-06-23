@@ -261,8 +261,7 @@ async fn in_task(
 #[allow(clippy::too_many_arguments)]
 async fn out_task(
     mut ep: Endpoint<Bulk, Out>, mut rx: mpsc::Receiver<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
-    max_packet_size: usize,
-    _close_tx: mpsc::Sender<()>,
+    max_packet_size: usize, close_tx: mpsc::Sender<()>,
 ) {
     while let Some(data) = rx.recv().await {
         #[cfg(feature = "trace-packets")]
@@ -299,6 +298,8 @@ async fn out_task(
             }
         }
     }
+
+    let _ = close_tx.send(()).await;
 }
 
 async fn close_task(iface: Interface, interface: u8, mut close_rx: mpsc::Receiver<()>) {
