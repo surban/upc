@@ -212,7 +212,7 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
 
     let (tx_out, rx_out) = mpsc::channel(BUFFER_COUNT);
     let error_out = error.clone();
-    tasks.spawn(out_task(ep_out, rx_out, error_out, close_tx.clone()));
+    tasks.spawn(out_task(ep_out, rx_out, error_out, max_packet_size, close_tx.clone()));
 
     tokio::spawn(close_task(iface, interface, close_rx));
 
@@ -261,6 +261,7 @@ async fn in_task(
 #[allow(clippy::too_many_arguments)]
 async fn out_task(
     mut ep: Endpoint<Bulk, Out>, mut rx: mpsc::Receiver<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
+    max_packet_size: usize,
     _close_tx: mpsc::Sender<()>,
 ) {
     while let Some(data) = rx.recv().await {
@@ -268,6 +269,10 @@ async fn out_task(
         tracing::trace!("Queueing packet of {} bytes for sending", data.len());
 
         ep.submit(Buffer::from(data.to_vec()));
+
+        if data.len() != 0 && data.len() % max_packet_size == 0 {
+            ep.submit(Buffer::new(0));
+        }
 
         let mut get_complete = async || {
             if ep.pending() >= BUFFER_COUNT {

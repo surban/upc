@@ -87,7 +87,7 @@ async fn main() {
     let elapsed = start.elapsed().as_secs_f32();
     println!("Sent {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f32 / elapsed / 1_048_576.);
 
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(3)).await;
 
     println!("Waiting for receiver...");
     rx_task.await.unwrap();
