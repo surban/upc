@@ -6,7 +6,7 @@ keywords = ["usb", "gadget", "packet", "channel"]
 license = "Apache-2.0"
 repository = "https://github.com/surban/upc"
 authors = ["Sebastian Urban <surban@surban.net>"]
-version = "0.7.1"
+version = "0.8.0-beta1"
 edition = "2021"
 rust-version = "1.83"
 autoexamples = false
@@ -29,7 +29,7 @@ bytes = "1.4"
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", features = ["Window", "WorkerGlobalScope"] }
-webusb-web = { version = "0.4", optional = true }
+webusb-web = { version = "0.4.1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 
 [dev-dependencies]

@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## 0.8.0-beta1 - 2025-06-24
+### Changed
+- host: switch from rusb to nusb
+
 ## 0.7.1 - 2025-02-19
 ### Fixed
 - MSRV
