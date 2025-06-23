@@ -14,8 +14,8 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use webusb_web::{OpenUsbDevice, UsbControlRequest, UsbDevice, UsbDirection, UsbRecipient, UsbRequestType};
 
-use super::{UpcReceiver, UpcSender};
-use crate::{host::InUseGuard, Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
+use super::{guard::InUseGuard, UpcReceiver, UpcSender};
+use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
 
 pub(crate) fn to_io_err(error: webusb_web::Error) -> Error {
     let kind = match error.kind() {
@@ -212,7 +212,7 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
 }
 
 async fn in_task(
-    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<BytesMut>, ep: u8, iface: u8,
+    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<Bytes>, ep: u8, iface: u8,
     error: Arc<Mutex<Option<webusb_web::Error>>>, max_transfer_size: usize, closed: Rc<Cell<bool>>,
 ) {
     loop {
