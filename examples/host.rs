@@ -1,9 +1,6 @@
 //! Host-side example.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use tokio::{sync::oneshot, time::sleep};
 use upc::host::{connect, find_interface, info};
@@ -15,21 +12,25 @@ use common::*;
 async fn main() {
     init_log();
 
-    let dev = rusb::open_device_with_vid_pid(VID, PID).expect("device not found").device();
-    println!("Using device: {dev:?}");
+    let dev_info = nusb::list_devices()
+        .await
+        .expect("cannot enumerate USB devices")
+        .find(|cand| cand.vendor_id() == VID && cand.product_id() == PID)
+        .expect("device not found");
+    println!("Using device: {dev_info:?}");
 
     println!("Finding interface...");
-    let iface = find_interface(&dev, CLASS).expect("cannot find interface");
+    let iface = find_interface(&dev_info, CLASS).expect("cannot find interface");
     println!("Using interface {iface}");
 
     println!("Getting info...");
-    let hnd = dev.open().expect("cannot open device");
-    let info = info(&hnd, iface).await.expect("cannot get info");
+    let dev = dev_info.open().await.expect("cannot open device");
+    let info = info(&dev, iface).await.expect("cannot get info");
     println!("Info: {}", String::from_utf8_lossy(&info));
     assert_eq!(info, INFO, "info mismatch");
 
     println!("Connecting...");
-    let (tx, mut rx) = connect(Arc::new(hnd), iface, TOPIC).await.expect("cannot connect");
+    let (tx, mut rx) = connect(dev, iface, TOPIC).await.expect("cannot connect");
 
     let (rx_task_done_tx, rx_task_done_rx) = oneshot::channel();
     let rx_task = tokio::spawn(async move {
@@ -79,7 +80,7 @@ async fn main() {
     println!("Sent {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f32 / elapsed / 1_048_576.);
 
     rx_task_done_rx.await.unwrap();
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(3)).await;
 
     println!("Disconnecting...");
     drop(tx);

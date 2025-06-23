@@ -13,15 +13,15 @@ autoexamples = false
 
 [features]
 default = []
-host = ["dep:rusb", "tokio/rt"]
+host = ["dep:nusb", "tokio/rt"]
 device = ["dep:usb-gadget", "tokio/rt"]
 web = ["dep:js-sys", "dep:webusb-web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 trace-packets = []
 
 [dependencies]
 futures = "0.3"
-tokio = { version = "1.43", features = ["macros", "sync"] }
-rusb = { version = "0.9.3", optional = true }
+tokio = { version = "1.43", features = ["macros", "sync", "time"] }
+nusb = { version = "=0.2.0-beta.2", features = ["tokio"], optional = true }
 usb-gadget = { version = "0.7", features = ["tokio"], optional = true }
 tracing = "0.1"
 uuid = "1.13"

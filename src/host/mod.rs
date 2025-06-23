@@ -17,17 +17,18 @@
 use bytes::{Bytes, BytesMut};
 use futures::{sink, stream, Sink, SinkExt, Stream, StreamExt};
 use std::{
-    collections::HashSet,
     fmt,
     future::Future,
     io::{Error, ErrorKind, Result},
     mem::take,
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::sync::mpsc;
 
+#[cfg(feature = "web")]
+mod guard;
 #[cfg(feature = "web")]
 mod web;
 #[cfg(feature = "web")]
@@ -117,7 +118,7 @@ impl Sink<Bytes> for UpcSink {
 
 /// Receives data from a USB packet channel.
 pub struct UpcReceiver {
-    rx: mpsc::Receiver<BytesMut>,
+    rx: mpsc::Receiver<Bytes>,
     shared: Arc<UpcShared>,
     buffer: BytesMut,
     max_size: usize,
@@ -135,14 +136,14 @@ impl UpcReceiver {
     ///
     /// ## Cancel safety
     /// If canceled, no data will have been removed from the receive queue.
-    pub async fn recv(&mut self) -> Result<BytesMut> {
+    pub async fn recv(&mut self) -> Result<Bytes> {
         loop {
             let Some(packet) = self.rx.recv().await else {
                 return Err(Error::new(ErrorKind::BrokenPipe, "UPC channel closed"));
             };
 
             let packet_len = packet.len();
-            self.buffer.unsplit(packet);
+            self.buffer.unsplit(packet.into());
 
             if self.buffer.len() > self.max_size {
                 self.buffer.clear();
@@ -150,7 +151,7 @@ impl UpcReceiver {
             }
 
             if packet_len < self.max_transfer_size {
-                return Ok(take(&mut self.buffer));
+                return Ok(take(&mut self.buffer).into());
             }
         }
     }
@@ -175,7 +176,7 @@ impl UpcReceiver {
 }
 
 /// Packet stream from a USB packet channel.
-pub struct UpcStream(Pin<Box<dyn Stream<Item = Result<BytesMut>> + Send + Sync + 'static>>);
+pub struct UpcStream(Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + Sync + 'static>>);
 
 impl fmt::Debug for UpcStream {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -184,37 +185,9 @@ impl fmt::Debug for UpcStream {
 }
 
 impl Stream for UpcStream {
-    type Item = Result<BytesMut>;
+    type Item = Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).0.poll_next_unpin(cx)
-    }
-}
-
-static IN_USE: LazyLock<Mutex<HashSet<(usize, u8)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
-pub(crate) struct InUseGuard {
-    handle: usize,
-    interface: u8,
-}
-
-impl InUseGuard {
-    pub fn new(handle: usize, interface: u8) -> Result<Self> {
-        let mut in_use = IN_USE.lock().unwrap();
-
-        if in_use.contains(&(handle, interface)) {
-            return Err(Error::new(ErrorKind::ResourceBusy, "interface is used by another UPC channel"));
-        }
-
-        in_use.insert((handle, interface));
-
-        Ok(Self { handle, interface })
-    }
-}
-
-impl Drop for InUseGuard {
-    fn drop(&mut self) {
-        let mut in_use = IN_USE.lock().unwrap();
-        in_use.remove(&(self.handle, self.interface));
     }
 }
