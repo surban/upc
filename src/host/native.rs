@@ -84,11 +84,29 @@ impl From<TransferError> for TaskError {
     }
 }
 
-/// Finds the interface by interface class.
+/// Finds the interface by interface class from USB device information.
 ///
 /// Returns the interface number.
 pub fn find_interface(dev_info: &DeviceInfo, class: Class) -> Result<u8> {
     for iface in dev_info.interfaces() {
+        if iface.class() == class.class
+            && iface.subclass() == class.sub_class
+            && iface.protocol() == class.protocol
+        {
+            return Ok(iface.interface_number());
+        }
+    }
+
+    Err(Error::new(ErrorKind::NotFound, format!("USB interface for {class:?} not found")))
+}
+
+/// Finds the interface by interface class for an opened USB device.
+///
+/// Returns the interface number.
+pub fn find_interface_opened(dev: &Device, class: Class) -> Result<u8> {
+    let cfg = dev.active_configuration()?;
+    for iface in cfg.interfaces() {
+        let iface = iface.first_alt_setting();
         if iface.class() == class.class
             && iface.subclass() == class.sub_class
             && iface.protocol() == class.protocol
