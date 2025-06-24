@@ -269,7 +269,7 @@ async fn out_task(
 
         ep.submit(Buffer::from(data.to_vec()));
 
-        if data.len() != 0 && data.len() % max_packet_size == 0 {
+        if !data.is_empty() && data.len() % max_packet_size == 0 {
             ep.submit(Buffer::new(0));
         }
 
