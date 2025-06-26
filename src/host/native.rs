@@ -292,7 +292,10 @@ async fn out_task(
         }
 
         let mut get_complete = async || {
-            if ep.pending() >= BUFFER_COUNT {
+            let pending = ep.pending();
+            if pending == 0 {
+                None
+            } else if pending >= BUFFER_COUNT {
                 Some(ep.next_complete().await)
             } else {
                 ep.next_complete().now_or_never()
