@@ -3,9 +3,9 @@
 //!
 //! ### Native platforms (crate feature `native`)
 //!
-//! To open a channel, use [`rusb`] to find the target device and then pass it to [`connect`].
+//! To open a channel, use [`nusb`] to find the target device and then pass it to [`connect`].
 //!
-//! Some errors from this module have an inner error type of [`rusb::Error`].
+//! Some errors from this module have an inner error type of [`nusb::Error`].
 //!
 //! ### Web platform (crate feature `web` and targeting `wasm32-*`)
 //!

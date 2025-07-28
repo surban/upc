@@ -27,9 +27,11 @@ Requirements
 
 The minimum support Rust version (MSRV) is 1.85.
 
-The native host-side part supports any operating system supported by `libusb`.
+The native host-side part supports any operating system supported by [nusb].
 
 The device-side part requires Linux and a USB device controller (UDC).
+
+[nusb]: https://crates.io/crates/nusb
 
 License
 -------
