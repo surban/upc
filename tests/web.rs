@@ -1,5 +1,8 @@
 #![cfg(all(feature = "web", target_arch = "wasm32"))]
 
+use wasm_bindgen_test::wasm_bindgen_test_configure;
+wasm_bindgen_test_configure!(run_in_browser);
+
 use std::rc::Rc;
 use tokio::sync::oneshot;
 use wasm_bindgen_futures::spawn_local;
