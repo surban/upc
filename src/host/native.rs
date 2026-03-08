@@ -33,7 +33,7 @@ const fn control_in(request: u8, value: u16, index: u16, length: u16) -> Control
     }
 }
 
-const fn control_out(request: u8, value: u16, index: u16, data: &[u8]) -> ControlOut {
+const fn control_out(request: u8, value: u16, index: u16, data: &[u8]) -> ControlOut<'_> {
     ControlOut { control_type: ControlType::Vendor, recipient: Recipient::Interface, request, value, index, data }
 }
 
