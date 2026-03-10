@@ -1,9 +1,4 @@
-//! # USB packet channel (UPC)
-//!
-//! This library provides a reliable, packet-based transport over a physical USB connection
-//! with an asynchronous API.
-//!
-
+#![doc = include_str!("../README.md")]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]

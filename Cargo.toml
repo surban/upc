@@ -17,7 +17,7 @@ default = []
 host = ["dep:nusb", "tokio/rt"]
 device = ["dep:usb-gadget", "tokio/rt"]
 web = ["dep:js-sys", "dep:webusb-web", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
-cli = ["dep:clap", "tokio/io-std", "tokio/io-util"]
+cli = ["dep:clap", "dep:tracing-subscriber", "dep:tracing-log", "tokio/io-std", "tokio/io-util"]
 trace-packets = []
 
 [dependencies]
@@ -34,6 +34,8 @@ web-sys = { version = "0.3", features = ["Window", "WorkerGlobalScope"] }
 webusb-web = { version = "0.4.1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"], optional = true }
+tracing-log = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["time"] }
