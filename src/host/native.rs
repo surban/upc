@@ -23,6 +23,8 @@ use super::{UpcReceiver, UpcSender};
 use crate::{ctrl_req, notify, Class, INFO_SIZE, MAX_SIZE};
 
 const TIMEOUT: Duration = Duration::from_secs(1);
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const BUFFER_COUNT: usize = 16;
 
 const fn control_in(request: u8, value: u16, index: u16, length: u16) -> ControlIn {
@@ -258,7 +260,24 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
     let max_transfer_size = max_packet_size * 128;
 
     // Open device and claim interface.
-    let iface = dev.claim_interface(interface).await.map_err(nusb_to_io_err)?;
+    // Retry if the interface is still busy from a previous connection whose
+    // background tasks have not yet finished releasing it.
+    let iface = {
+        let deadline = tokio::time::Instant::now() + CLAIM_TIMEOUT;
+        loop {
+            match dev.claim_interface(interface).await {
+                Ok(iface) => break iface,
+                Err(err) if err.kind() == nusb::ErrorKind::Busy => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(nusb_to_io_err(err));
+                    }
+                    tracing::debug!("interface {interface} is busy, retrying…");
+                    tokio::time::sleep(CLAIM_RETRY_INTERVAL).await;
+                }
+                Err(err) => return Err(nusb_to_io_err(err)),
+            }
+        }
+    };
     let mut ep_in = iface.endpoint::<Bulk, In>(ep_in).map_err(nusb_to_io_err)?;
     let mut ep_out = iface.endpoint::<Bulk, Out>(ep_out).map_err(nusb_to_io_err)?;
     ep_in.clear_halt().await.map_err(nusb_to_io_err)?;

@@ -187,7 +187,23 @@ impl Drop for UpcShared {
 pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Result<(UpcSender, UpcReceiver)> {
     assert!(topic.len() <= INFO_SIZE, "topic too big");
 
-    let guard = Rc::new(InUseGuard::new(Rc::as_ptr(&hnd) as _, interface)?);
+    // Retry if the interface is still in use from a previous connection whose
+    // background tasks have not yet finished releasing it.
+    let guard = {
+        let key = Rc::as_ptr(&hnd) as usize;
+        let mut remaining = 100u32;
+        Rc::new(loop {
+            match InUseGuard::new(key, interface) {
+                Ok(guard) => break guard,
+                Err(err) if err.kind() == ErrorKind::ResourceBusy && remaining > 0 => {
+                    remaining -= 1;
+                    tracing::debug!("interface {interface} is in use, retrying…");
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        })
+    };
     let dev = hnd.device();
 
     // Get endpoints.
