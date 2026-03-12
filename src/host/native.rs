@@ -3,21 +3,24 @@
 use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
 use nusb::{
+    descriptors::TransferType,
     transfer::{
-        Buffer, Bulk, Completion, ControlIn, ControlOut, ControlType, Direction, In, Out, Recipient,
+        Buffer, Bulk, Completion, ControlIn, ControlOut, ControlType, Direction, In, Interrupt, Out, Recipient,
         TransferError,
     },
     Device, DeviceInfo, Endpoint, Interface,
 };
 use std::{
+    future::{self, Future},
     io::{Error, ErrorKind, Result},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{sync::mpsc, task::JoinSet, time::timeout};
+use tokio::{sync::mpsc, time::timeout};
 
 use super::{UpcReceiver, UpcSender};
-use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
+use crate::{ctrl_req, notify, Class, INFO_SIZE, MAX_SIZE};
 
 const TIMEOUT: Duration = Duration::from_secs(1);
 const BUFFER_COUNT: usize = 16;
@@ -128,7 +131,7 @@ pub async fn info(dev: &Device, interface: u8) -> Result<Vec<u8>> {
     // Read info.
     tracing::debug!("reading info");
     let info = iface
-        .control_in(control_in(CTRL_REQ_INFO, 0, interface.into(), INFO_SIZE.try_into().unwrap()), TIMEOUT)
+        .control_in(control_in(ctrl_req::INFO, 0, interface.into(), INFO_SIZE.try_into().unwrap()), TIMEOUT)
         .await
         .map_err(transfer_to_io_err)?;
 
@@ -138,13 +141,76 @@ pub async fn info(dev: &Device, interface: u8) -> Result<Vec<u8>> {
 pub(crate) struct UpcShared {
     pub(crate) name: String,
     pub(crate) error: Arc<Mutex<Option<TaskError>>>,
-    pub(crate) _tasks: JoinSet<()>,
-    pub(crate) _close_tx: mpsc::Sender<()>,
 }
 
-impl Drop for UpcShared {
-    fn drop(&mut self) {
-        // empty: tasks will be terminated by JoinSet
+/// Tracks half-close state and sends control requests when each direction closes.
+pub(crate) struct HalfCloseHandle {
+    iface: Interface,
+    interface: u8,
+    send_closed: bool,
+    recv_closed: bool,
+}
+
+impl HalfCloseHandle {
+    fn new(iface: Interface, interface: u8) -> Self {
+        Self { iface, interface, send_closed: false, recv_closed: false }
+    }
+
+    /// Mark send direction as closed.
+    ///
+    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_SEND.
+    /// If false (device-initiated close via notification), no control request is sent.
+    async fn close_send(&mut self, notify_device: bool) {
+        if !self.send_closed {
+            self.send_closed = true;
+            if notify_device {
+                tracing::debug!("host send closed, sending CTRL_REQ_CLOSE_SEND");
+                if let Err(err) = self
+                    .iface
+                    .control_out(control_out(ctrl_req::CLOSE_SEND, 0, self.interface.into(), &[]), TIMEOUT)
+                    .await
+                {
+                    tracing::warn!("sending CTRL_REQ_CLOSE_SEND failed: {err}");
+                }
+            } else {
+                tracing::debug!("send direction closed (device-initiated)");
+            }
+            self.close_if_both().await;
+        }
+    }
+
+    /// Mark receive direction as closed.
+    ///
+    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_RECV.
+    /// If false (device-initiated close via notification), no control request is sent.
+    async fn close_recv(&mut self, notify_device: bool) {
+        if !self.recv_closed {
+            self.recv_closed = true;
+            if notify_device {
+                tracing::debug!("host recv closed, sending CTRL_REQ_CLOSE_RECV");
+                if let Err(err) = self
+                    .iface
+                    .control_out(control_out(ctrl_req::CLOSE_RECV, 0, self.interface.into(), &[]), TIMEOUT)
+                    .await
+                {
+                    tracing::warn!("sending CTRL_REQ_CLOSE_RECV failed: {err}");
+                }
+            } else {
+                tracing::debug!("recv direction closed (device-initiated)");
+            }
+            self.close_if_both().await;
+        }
+    }
+
+    async fn close_if_both(&mut self) {
+        if self.send_closed && self.recv_closed {
+            tracing::debug!("closing connection, sending CTRL_REQ_CLOSE");
+            if let Err(err) =
+                self.iface.control_out(control_out(ctrl_req::CLOSE, 0, self.interface.into(), &[]), TIMEOUT).await
+            {
+                tracing::warn!("sending CTRL_REQ_CLOSE failed: {err}");
+            }
+        }
     }
 }
 
@@ -161,6 +227,7 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
     // Get endpoints.
     let mut ep_in = None;
     let mut ep_out = None;
+    let mut ep_notify = None;
     let mut max_packet_size = usize::MAX;
     {
         let cfg = dev.active_configuration().map_err(|err| Error::new(ErrorKind::NetworkDown, err))?;
@@ -169,10 +236,19 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
             .find(|i| i.interface_number() == interface)
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("interface {interface} not found")))?;
         for ep in iface_desc.first_alt_setting().endpoints() {
-            max_packet_size = max_packet_size.min(ep.max_packet_size());
-            match ep.direction() {
-                Direction::In => ep_in = Some(ep.address()),
-                Direction::Out => ep_out = Some(ep.address()),
+            match (ep.direction(), ep.transfer_type()) {
+                (Direction::In, TransferType::Bulk) => {
+                    max_packet_size = max_packet_size.min(ep.max_packet_size());
+                    ep_in = Some(ep.address());
+                }
+                (Direction::Out, TransferType::Bulk) => {
+                    max_packet_size = max_packet_size.min(ep.max_packet_size());
+                    ep_out = Some(ep.address());
+                }
+                (Direction::In, TransferType::Interrupt) => {
+                    ep_notify = Some(ep.address());
+                }
+                _ => {}
             }
         }
     }
@@ -183,15 +259,24 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
 
     // Open device and claim interface.
     let iface = dev.claim_interface(interface).await.map_err(nusb_to_io_err)?;
-    let mut ep_in = iface.endpoint(ep_in).map_err(nusb_to_io_err)?;
-    let mut ep_out = iface.endpoint(ep_out).map_err(nusb_to_io_err)?;
+    let mut ep_in = iface.endpoint::<Bulk, In>(ep_in).map_err(nusb_to_io_err)?;
+    let mut ep_out = iface.endpoint::<Bulk, Out>(ep_out).map_err(nusb_to_io_err)?;
     ep_in.clear_halt().await.map_err(nusb_to_io_err)?;
     ep_out.clear_halt().await.map_err(nusb_to_io_err)?;
+
+    let mut ep_notify_ep = if let Some(ep_notify_addr) = ep_notify {
+        let mut ep = iface.endpoint::<Interrupt, In>(ep_notify_addr).map_err(nusb_to_io_err)?;
+        ep.clear_halt().await.map_err(nusb_to_io_err)?;
+        Some(ep)
+    } else {
+        tracing::debug!("no interrupt notification endpoint found, using STALL-only detection");
+        None
+    };
 
     // Close previous connection.
     tracing::debug!("closing previous connection");
     iface
-        .control_out(control_out(CTRL_REQ_CLOSE, 0, interface.into(), &[]), TIMEOUT)
+        .control_out(control_out(ctrl_req::CLOSE, 0, interface.into(), &[]), TIMEOUT)
         .await
         .map_err(transfer_to_io_err)?;
 
@@ -213,29 +298,31 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
     // Open connection.
     tracing::debug!("opening connection");
     iface
-        .control_out(control_out(CTRL_REQ_OPEN, 0, interface.into(), topic), TIMEOUT)
+        .control_out(control_out(ctrl_req::OPEN, 0, interface.into(), topic), TIMEOUT)
         .await
         .map_err(transfer_to_io_err)?;
     tracing::debug!("connection is open");
 
-    // Start handler taks.
+    // Start handler tasks.
     let error = Arc::new(Mutex::new(None));
     let name = format!("{dev:?}:{interface}");
-    let (close_tx, close_rx) = mpsc::channel(1);
+    let half_close = Arc::new(tokio::sync::Mutex::new(HalfCloseHandle::new(iface, interface)));
 
-    let mut tasks = JoinSet::new();
     let error_in = error.clone();
     let (tx_in, rx_in) = mpsc::channel(BUFFER_COUNT);
-    tasks.spawn(in_task(ep_in, tx_in, error_in, max_transfer_size, close_tx.clone()));
+    let half_close_in = half_close.clone();
+    tokio::spawn(in_task(ep_in, tx_in, error_in, max_transfer_size, half_close_in));
+
+    let device_close_recv: Pin<Box<dyn Future<Output = ()> + Send>> =
+        if let Some(ep) = ep_notify_ep.take() { Box::pin(notify_task(ep)) } else { Box::pin(future::pending()) };
 
     let (tx_out, rx_out) = mpsc::channel(BUFFER_COUNT);
     let error_out = error.clone();
-    tasks.spawn(out_task(ep_out, rx_out, error_out, max_packet_size, close_tx.clone()));
-
-    tokio::spawn(close_task(iface, interface, close_rx));
+    let half_close_out = half_close.clone();
+    tokio::spawn(out_task(ep_out, rx_out, error_out, max_packet_size, half_close_out, device_close_recv));
 
     // Build objects.
-    let shared = Arc::new(UpcShared { name, error, _tasks: tasks, _close_tx: close_tx });
+    let shared = Arc::new(UpcShared { name, error });
     let sender = UpcSender { tx: tx_out, shared: shared.clone() };
     let recv = UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: MAX_SIZE, max_transfer_size };
 
@@ -244,91 +331,156 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
 
 async fn in_task(
     mut ep: Endpoint<Bulk, In>, tx: mpsc::Sender<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
-    max_transfer_size: usize, _close_tx: mpsc::Sender<()>,
+    max_transfer_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
 ) {
-    // Pre-submit buffers.
-    for _ in 0..BUFFER_COUNT {
-        ep.submit(Buffer::new(max_transfer_size));
-    }
-
-    loop {
-        ep.submit(Buffer::new(max_transfer_size));
-        let comp = tokio::select! {
-            comp = ep.next_complete() => comp,
-            () = tx.closed() => break,
-        };
-
-        if let Err(err) = comp.status {
-            tracing::warn!("receiving failed: {err}");
-            *error.lock().unwrap() = Some(err.into());
-            break;
+    let host_initiated = {
+        // Pre-submit buffers.
+        for _ in 0..BUFFER_COUNT {
+            ep.submit(Buffer::new(max_transfer_size));
         }
 
-        let mut buf = comp.buffer.into_vec();
-        buf.truncate(comp.actual_len);
+        loop {
+            ep.submit(Buffer::new(max_transfer_size));
+            let comp = tokio::select! {
+                biased;
+                comp = ep.next_complete() => comp,
+                () = tx.closed() => break true,
+            };
 
-        #[cfg(feature = "trace-packets")]
-        tracing::trace!("Received packet of {} bytes", buf.len());
+            if let Err(err) = comp.status {
+                if err == TransferError::Stall {
+                    // Device halted the IN endpoint — clean half-close signal
+                    // meaning the device is done sending.
+                    tracing::debug!("device halted IN endpoint (done sending)");
+                } else {
+                    tracing::warn!("receiving failed: {err}");
+                    *error.lock().unwrap() = Some(err.into());
+                }
+                break false;
+            }
 
-        if tx.send(buf.into()).await.is_err() {
-            break;
+            let mut buf = comp.buffer.into_vec();
+            buf.truncate(comp.actual_len);
+
+            #[cfg(feature = "trace-packets")]
+            tracing::trace!("Received packet of {} bytes", buf.len());
+
+            if tx.send(buf.into()).await.is_err() {
+                break true;
+            }
         }
-    }
+    };
+
+    half_close.lock().await.close_recv(host_initiated).await;
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn out_task(
     mut ep: Endpoint<Bulk, Out>, mut rx: mpsc::Receiver<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
-    max_packet_size: usize, close_tx: mpsc::Sender<()>,
+    max_packet_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
+    mut device_close: Pin<Box<dyn Future<Output = ()> + Send>>,
 ) {
-    while let Some(data) = rx.recv().await {
-        #[cfg(feature = "trace-packets")]
-        tracing::trace!("Queueing packet of {} bytes for sending", data.len());
-
-        ep.submit(Buffer::from(data.to_vec()));
-
-        if !data.is_empty() && data.len() % max_packet_size == 0 {
-            ep.submit(Buffer::new(0));
-        }
-
-        let mut get_complete = async || {
-            let pending = ep.pending();
-            if pending == 0 {
-                None
-            } else if pending >= BUFFER_COUNT {
-                Some(ep.next_complete().await)
-            } else {
-                ep.next_complete().now_or_never()
-            }
-        };
-
-        while let Some(comp) = get_complete().await {
-            if let Err(err) = comp.status {
-                tracing::warn!("sending failed: {err}");
-                *error.lock().unwrap() = Some(err.into());
-                break;
-            }
+    let host_initiated = 'task: {
+        loop {
+            let data = tokio::select! {
+                biased;
+                () = &mut device_close => {
+                    tracing::debug!("received device close-recv notification in out_task");
+                    break 'task false;
+                }
+                data = rx.recv() => data,
+            };
+            let Some(data) = data else {
+                // Drain all pending completions so data reaches the device
+                // before we signal close.
+                while ep.pending() > 0 {
+                    let comp = ep.next_complete().await;
+                    if let Err(err) = comp.status {
+                        if err == TransferError::Stall {
+                            tracing::debug!("device halted OUT endpoint during flush");
+                        } else {
+                            tracing::warn!("sending failed during flush: {err}");
+                            *error.lock().unwrap() = Some(err.into());
+                        }
+                        break 'task false;
+                    }
+                }
+                break 'task true;
+            };
 
             #[cfg(feature = "trace-packets")]
-            tracing::trace!("Sent packet of {} bytes", comp.actual_len);
+            tracing::trace!("Queueing packet of {} bytes for sending", data.len());
 
-            if comp.actual_len != comp.buffer.len() {
-                tracing::warn!("only {} out of {} bytes were sent", comp.actual_len, comp.buffer.len());
-                *error.lock().unwrap() =
-                    Some(TaskError::PartialSend { size: comp.buffer.len(), sent: comp.actual_len });
+            ep.submit(Buffer::from(data.to_vec()));
+
+            if !data.is_empty() && data.len() % max_packet_size == 0 {
+                ep.submit(Buffer::new(0));
+            }
+
+            let mut get_complete = async || {
+                let pending = ep.pending();
+                if pending == 0 {
+                    None
+                } else if pending >= BUFFER_COUNT {
+                    Some(ep.next_complete().await)
+                } else {
+                    ep.next_complete().now_or_never()
+                }
+            };
+
+            while let Some(comp) = get_complete().await {
+                if let Err(err) = comp.status {
+                    if err == TransferError::Stall {
+                        // Device halted the OUT endpoint — clean half-close signal
+                        // meaning the device is done receiving.
+                        tracing::debug!("device halted OUT endpoint (done receiving)");
+                    } else {
+                        tracing::warn!("sending failed: {err}");
+                        *error.lock().unwrap() = Some(err.into());
+                    }
+                    break 'task false;
+                }
+
+                #[cfg(feature = "trace-packets")]
+                tracing::trace!("Sent packet of {} bytes", comp.actual_len);
+
+                if comp.actual_len != comp.buffer.len() {
+                    tracing::warn!("only {} out of {} bytes were sent", comp.actual_len, comp.buffer.len());
+                    *error.lock().unwrap() =
+                        Some(TaskError::PartialSend { size: comp.buffer.len(), sent: comp.actual_len });
+                }
             }
         }
-    }
+    };
 
-    let _ = close_tx.send(()).await;
+    half_close.lock().await.close_send(host_initiated).await;
 }
 
-async fn close_task(iface: Interface, interface: u8, mut close_rx: mpsc::Receiver<()>) {
-    let _ = close_rx.recv().await;
+async fn notify_task(mut ep: Endpoint<Interrupt, In>) {
+    // Pre-submit a buffer for interrupt IN polling.
+    ep.submit(Buffer::new(notify::MAX_PACKET_SIZE));
 
-    tracing::debug!("closing connection");
-    if let Err(err) = iface.control_out(control_out(CTRL_REQ_CLOSE, 0, interface.into(), &[]), TIMEOUT).await {
-        tracing::warn!("closing connection failed: {err}");
+    loop {
+        ep.submit(Buffer::new(notify::MAX_PACKET_SIZE));
+        let comp = ep.next_complete().await;
+
+        if let Err(err) = comp.status {
+            tracing::warn!("notification transfer failed: {err}");
+            return;
+        }
+
+        let mut buf = comp.buffer.into_vec();
+        buf.truncate(comp.actual_len);
+
+        for &byte in &buf {
+            match byte {
+                notify::CLOSE_RECV => {
+                    tracing::debug!("received device close-recv notification");
+                    return;
+                }
+                other => tracing::warn!("unknown notification byte: {other:#x}"),
+            }
+        }
     }
 }
 

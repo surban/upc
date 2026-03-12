@@ -32,7 +32,7 @@ trait UpcSend {
 
 /// Trait abstracting over host and device UPC receivers.
 trait UpcRecv {
-    fn upc_recv(&mut self) -> impl std::future::Future<Output = io::Result<Bytes>> + Send;
+    fn upc_recv(&mut self) -> impl std::future::Future<Output = io::Result<Option<Bytes>>> + Send;
 }
 
 #[cfg(feature = "host")]
@@ -44,7 +44,7 @@ impl UpcSend for upc::host::UpcSender {
 
 #[cfg(feature = "host")]
 impl UpcRecv for upc::host::UpcReceiver {
-    async fn upc_recv(&mut self) -> io::Result<Bytes> {
+    async fn upc_recv(&mut self) -> io::Result<Option<Bytes>> {
         self.recv().await
     }
 }
@@ -58,8 +58,8 @@ impl UpcSend for upc::device::UpcSender {
 
 #[cfg(feature = "device")]
 impl UpcRecv for upc::device::UpcReceiver {
-    async fn upc_recv(&mut self) -> io::Result<Bytes> {
-        self.recv().await.map(|data| data.freeze())
+    async fn upc_recv(&mut self) -> io::Result<Option<Bytes>> {
+        self.recv().await.map(|opt| opt.map(|data| data.freeze()))
     }
 }
 
@@ -101,21 +101,19 @@ async fn forward_stdio(
     let recv_task = tokio::spawn(async move {
         loop {
             match rx.upc_recv().await {
-                Ok(data) => {
+                Ok(Some(data)) => {
                     let mut stdout = stdout.lock();
                     if stdout.write_all(&data).and_then(|_| stdout.flush()).is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                Ok(None) | Err(_) => break,
             }
         }
     });
 
-    tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
-    }
+    let _ = send_task.await;
+    let _ = recv_task.await;
 }
 
 // ---- Argument parsing helpers ----

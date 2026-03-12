@@ -134,7 +134,7 @@ async fn loopback() {
 
             println!("[device-rx] Receiving…");
             for n in 0..TEST_PACKETS {
-                let data = dev_rx.recv().await.expect("device recv failed");
+                let data = dev_rx.recv().await.expect("device recv failed").expect("unexpected EOF");
                 if n % 50 == 0 {
                     println!("[device-rx] packet {n}: {} bytes", data.len());
                 }
@@ -143,7 +143,7 @@ async fn loopback() {
             println!("[device-rx] All {} packets received and validated", TEST_PACKETS);
 
             // Wait for sender to close.
-            dev_rx.recv().await.expect_err("device receiver not closed");
+            assert_eq!(dev_rx.recv().await.unwrap(), None, "device receiver not closed");
             println!("[device-rx] Receiver closed");
         });
 
@@ -232,7 +232,7 @@ async fn loopback() {
 
         println!("[host-rx] Receiving…");
         for n in 0..TEST_PACKETS {
-            let data = host_rx.recv().await.expect("host recv failed");
+            let data = host_rx.recv().await.expect("host recv failed").expect("unexpected EOF");
             if n % 50 == 0 {
                 println!("[host-rx] packet {n}: {} bytes", data.len());
             }
@@ -249,7 +249,7 @@ async fn loopback() {
         rx_done_tx.send(()).unwrap();
 
         // Wait for receiver to close.
-        host_rx.recv().await.expect_err("host receiver not closed");
+        assert_eq!(host_rx.recv().await.unwrap(), None, "host receiver not closed");
         println!("[host-rx] Receiver closed");
     });
 

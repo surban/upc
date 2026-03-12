@@ -65,7 +65,7 @@ async fn web() {
 
         log!("Receiving...");
         for n in 0..TEST_PACKETS {
-            let data = rx.recv().await.expect_log("receive failed");
+            let data = rx.recv().await.expect_log("receive failed").expect("unexpected EOF");
             log!("Recv {n}: {} bytes", data.len());
             total += data.len();
             rx_testdata.validate(&data);
@@ -78,7 +78,7 @@ async fn web() {
         rx_task_done_tx.send(()).unwrap();
 
         log!("Waiting for receiver close");
-        rx.recv().await.expect_err("receiver not closed");
+        assert_eq!(rx.recv().await.unwrap(), None, "receiver not closed");
         log!("Receiver closed");
 
         rx_task_finished_tx.send(()).unwrap();

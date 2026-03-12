@@ -23,13 +23,13 @@ use tokio::{
 use usb_gadget::function::{
     custom::{
         Custom, CustomBuilder, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface,
-        OsExtCompat, OsExtProp,
+        OsExtCompat, OsExtProp, TransferType,
     },
     Handle,
 };
 use uuid::Uuid;
 
-use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
+use crate::{ctrl_req, notify, Class, INFO_SIZE, MAX_SIZE};
 
 /// Sends data into a USB packet channel.
 pub struct UpcSender {
@@ -122,13 +122,11 @@ impl UpcReceiver {
     ///
     /// ## Cancel safety
     /// If canceled, no data will have been removed from the receive queue.
-    pub async fn recv(&mut self) -> Result<BytesMut> {
+    pub async fn recv(&mut self) -> Result<Option<BytesMut>> {
         loop {
-            let packet = self
-                .rx
-                .recv()
-                .await
-                .ok_or_else(|| Error::new(ErrorKind::ConnectionReset, "connection closed"))?;
+            let Some(packet) = self.rx.recv().await else {
+                return Ok(None);
+            };
             let packet_len = packet.len();
             self.buffer.unsplit(packet);
 
@@ -141,7 +139,7 @@ impl UpcReceiver {
             }
 
             if packet_len < self.max_packet_size {
-                return Ok(take(&mut self.buffer));
+                return Ok(Some(take(&mut self.buffer)));
             }
         }
     }
@@ -160,9 +158,9 @@ impl UpcReceiver {
     pub fn into_stream(self) -> UpcStream {
         let stream = stream::try_unfold(self, |mut this| async move {
             match this.recv().await {
-                Ok(data) => Ok(Some((data, this))),
-                Err(err) if err.kind() == ErrorKind::ConnectionReset => Ok(None),
-                Err(err) => Err(Error::new(ErrorKind::ConnectionReset, err)),
+                Ok(Some(data)) => Ok(Some((data, this))),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
             }
         });
 
@@ -276,10 +274,17 @@ impl UpcFunction {
     ) -> Result<(Self, T)> {
         let (ep_rx, ep_rx_dir) = EndpointDirection::host_to_device();
         let (ep_tx, ep_tx_dir) = EndpointDirection::device_to_host();
+        let (ep_notify, ep_notify_dir) = EndpointDirection::device_to_host();
+
+        let mut ep_notify_desc = Endpoint::custom(ep_notify_dir, TransferType::Interrupt);
+        ep_notify_desc.max_packet_size_hs = notify::MAX_PACKET_SIZE as u16;
+        ep_notify_desc.max_packet_size_ss = notify::MAX_PACKET_SIZE as u16;
+        ep_notify_desc.interval = 9;
 
         let mut interface = Interface::new(interface_id.class.into(), &interface_id.name)
             .with_endpoint(Endpoint::bulk(ep_rx_dir))
             .with_endpoint(Endpoint::bulk(ep_tx_dir))
+            .with_endpoint(ep_notify_desc)
             .with_os_ext_compat(OsExtCompat::winusb());
         if let Some(guid) = interface_id.guid {
             interface = interface.with_os_ext_prop(OsExtProp::device_interface_guid(guid));
@@ -292,7 +297,7 @@ impl UpcFunction {
         let info = Arc::new(Mutex::new(Vec::new()));
 
         let mut task = JoinSet::new();
-        task.spawn(Self::task(ep0, ep_tx, ep_rx, conn_tx, info.clone()));
+        task.spawn(Self::task(ep0, ep_tx, ep_rx, ep_notify, conn_tx, info.clone()));
 
         Ok((Self { class: interface_id.class, name: interface_id.name.to_string(), task, conn_rx, info }, ret))
     }
@@ -325,12 +330,22 @@ impl UpcFunction {
     async fn in_task(ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<BytesMut>) -> Result<()> {
         let mut ep_rx = ep_rx.lock().await;
         let max_packet_size = ep_rx.max_packet_size()?;
+        let tx2 = tx.clone();
 
         while let Ok(permit) = tx.reserve().await {
-            if let Some(data) = ep_rx.recv_async(BytesMut::with_capacity(max_packet_size)).await? {
-                #[cfg(feature = "trace-packets")]
-                tracing::trace!("Received packet of {} bytes", data.len());
-                permit.send(data);
+            // Select between receiving USB data and detecting that the
+            // UpcReceiver has been dropped (so we can send the CLOSE_RECV
+            // notification promptly even when the host is idle).
+            tokio::select! {
+                biased;
+                res = ep_rx.recv_async(BytesMut::with_capacity(max_packet_size)) => {
+                    if let Some(data) = res? {
+                        #[cfg(feature = "trace-packets")]
+                        tracing::trace!("Received packet of {} bytes", data.len());
+                        permit.send(data);
+                    }
+                }
+                () = tx2.closed() => break,
             }
         }
 
@@ -354,11 +369,15 @@ impl UpcFunction {
             }
         }
 
+        // Flush the send queue so all enqueued data reaches the host
+        // before we signal closure.
+        ep_tx.flush_async().await?;
+
         Ok(())
     }
 
     async fn task(
-        mut ep0: Custom, ep_tx: EndpointSender, ep_rx: EndpointReceiver,
+        mut ep0: Custom, ep_tx: EndpointSender, ep_rx: EndpointReceiver, ep_notify: EndpointSender,
         conn_tx: mpsc::Sender<(UpcSender, UpcReceiver)>, info: Arc<Mutex<Vec<u8>>>,
     ) -> Result<()> {
         let status = ep0.status();
@@ -379,26 +398,15 @@ impl UpcFunction {
 
         let ep_tx = Mutex::new(ep_tx);
         let ep_rx = Mutex::new(ep_rx);
+        let ep_notify = Mutex::new(ep_notify);
 
         let mut in_task = future::pending().boxed();
         let mut out_task = future::pending().boxed();
 
-        let mut do_halt = false;
-        let mut is_open = false;
+        let mut send_open = false;
+        let mut recv_open = false;
 
         loop {
-            if do_halt {
-                tracing::debug!("halting endpoints");
-                in_task = future::pending().boxed();
-                out_task = future::pending().boxed();
-                ep_tx.lock().await.cancel()?;
-                ep_rx.lock().await.cancel()?;
-                let _ = ep_tx.lock().await.control()?.halt();
-                let _ = ep_rx.lock().await.control()?.halt();
-                do_halt = false;
-                is_open = false;
-            }
-
             tokio::select! {
                 () = &mut unbound => {
                     tracing::debug!("device unbound");
@@ -426,7 +434,9 @@ impl UpcFunction {
                             out_task = future::pending().boxed();
                             ep_tx.lock().await.cancel()?;
                             ep_rx.lock().await.cancel()?;
-                            is_open = false;
+                            ep_notify.lock().await.cancel()?;
+                            send_open = false;
+                            recv_open = false;
                             max_packet_size = None;
                         }
 
@@ -434,16 +444,20 @@ impl UpcFunction {
                             let ctrl_req = req.ctrl_req();
                             tracing::debug!("incoming control request: {ctrl_req:?}");
                             match ctrl_req.request {
-                                CTRL_REQ_OPEN => {
+                                ctrl_req::OPEN => {
                                     tracing::debug!("open connection request");
 
-                                    if is_open {
+                                    if send_open || recv_open {
                                         tracing::debug!("closing previous connection");
                                         in_task = future::pending().boxed();
                                         out_task = future::pending().boxed();
                                         ep_tx.lock().await.cancel()?;
                                         ep_rx.lock().await.cancel()?;
                                     }
+
+                                    // Clear any halt status left from a previous connection's half-close.
+                                    let _ = ep_tx.lock().await.control()?.clear_halt();
+                                    let _ = ep_rx.lock().await.control()?.clear_halt();
 
                                     // WORKAROUND: some UDCs fail the first incoming transfer when no
                                     //             receive buffers are enqueued.
@@ -455,7 +469,8 @@ impl UpcFunction {
                                             let _ = conn_tx.send((ctx, crx)).await;
                                             in_task = Self::in_task(&ep_rx, tx).boxed();
                                             out_task = Self::out_task(&ep_tx, rx).boxed();
-                                            is_open = true;
+                                            send_open = true;
+                                            recv_open = true;
                                             tracing::debug!("connection established");
                                         }
                                         Err(err) => {
@@ -465,16 +480,46 @@ impl UpcFunction {
                                     }
                                 }
 
-                                CTRL_REQ_CLOSE => {
+                                ctrl_req::CLOSE => {
                                     tracing::debug!("close connection request");
                                     in_task = future::pending().boxed();
                                     out_task = future::pending().boxed();
                                     ep_tx.lock().await.cancel()?;
                                     ep_rx.lock().await.cancel()?;
+                                    ep_notify.lock().await.cancel()?;
                                     if let Err(err) = req.recv_all() {
                                         tracing::warn!("close request receive error: {err}");
                                     }
-                                    is_open = false;
+                                    send_open = false;
+                                    recv_open = false;
+                                }
+
+                                ctrl_req::CLOSE_SEND => {
+                                    tracing::debug!("host closed send direction");
+                                    if let Err(err) = req.recv_all() {
+                                        tracing::warn!("close-send request receive error: {err}");
+                                    }
+                                    if recv_open {
+                                        // Stop receiving from the host (the in_task reads from OUT endpoint).
+                                        in_task = future::pending().boxed();
+                                        ep_rx.lock().await.cancel()?;
+                                        recv_open = false;
+                                        tracing::debug!("receive direction closed");
+                                    }
+                                }
+
+                                ctrl_req::CLOSE_RECV => {
+                                    tracing::debug!("host closed receive direction");
+                                    if let Err(err) = req.recv_all() {
+                                        tracing::warn!("close-recv request receive error: {err}");
+                                    }
+                                    if send_open {
+                                        // Stop sending to the host (the out_task writes to IN endpoint).
+                                        out_task = future::pending().boxed();
+                                        ep_tx.lock().await.cancel()?;
+                                        send_open = false;
+                                        tracing::debug!("send direction closed");
+                                    }
                                 }
 
                                 other => tracing::warn!("unknown control request {other:x}"),
@@ -485,7 +530,7 @@ impl UpcFunction {
                             let ctrl_req = req.ctrl_req();
                             tracing::debug!("outgoing control request: {ctrl_req:?}");
                             match ctrl_req.request {
-                                CTRL_REQ_INFO => {
+                                ctrl_req::INFO => {
                                     tracing::debug!("sending info");
                                     if let Err(err) = req.send(&info.lock().await) {
                                         tracing::warn!("info send error: {err}");
@@ -500,19 +545,34 @@ impl UpcFunction {
                 }
 
                 res = &mut in_task => {
+                    // in_task ended: device-side UpcReceiver was dropped
+                    // Halt the OUT endpoint and send notification to signal the host.
                     match res {
-                        Ok(()) => tracing::debug!("receiver dropped"),
-                        Err(err) => tracing::warn!("receiver failed: {err}")
+                        Ok(()) => tracing::debug!("device receiver dropped"),
+                        Err(err) => tracing::warn!("device receiver failed: {err}")
                     }
-                    do_halt = true;
+                    recv_open = false;
+                    in_task = future::pending().boxed();
+                    ep_rx.lock().await.cancel()?;
+                    if let Err(err) = ep_notify.lock().await.send_async(Bytes::from_static(&[notify::CLOSE_RECV])).await {
+                        tracing::warn!("failed to send close-recv notification: {err}");
+                    }
+                    let _ = ep_rx.lock().await.control()?.halt();
+                    tracing::debug!("OUT endpoint halted (device done receiving)");
                 }
 
                 res = &mut out_task => {
+                    // out_task ended: device-side UpcSender was dropped.
+                    // The send queue has been flushed, so all data has been delivered.
+                    // Halt the IN endpoint and send notification to signal the host.
                     match res {
-                        Ok(()) => tracing::debug!("sender dropped"),
-                        Err(err) => tracing::warn!("sender failed: {err}")
+                        Ok(()) => tracing::debug!("device sender dropped"),
+                        Err(err) => tracing::warn!("device sender failed: {err}")
                     }
-                    do_halt = true;
+                    send_open = false;
+                    out_task = future::pending().boxed();
+                    let _ = ep_tx.lock().await.control()?.halt();
+                    tracing::debug!("IN endpoint halted (device done sending)");
                 }
 
             }

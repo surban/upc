@@ -52,7 +52,7 @@ async fn main() {
 
         println!("Receiving...");
         for n in 0..TEST_PACKETS {
-            let data = rx.recv().await.expect("receive failed");
+            let data = rx.recv().await.expect("receive failed").expect("unexpected EOF");
             eprintln!("Recv {n}: {} bytes", data.len());
             total += data.len();
             rx_testdata.validate(&data);
@@ -63,7 +63,7 @@ async fn main() {
         println!("Received {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f32 / elapsed / 1_048_576.);
 
         println!("Waiting for receiver close");
-        rx.recv().await.expect_err("receiver not closed");
+        assert_eq!(rx.recv().await.unwrap(), None, "receiver not closed");
         println!("Receiver closed");
     });
 

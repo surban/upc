@@ -2,8 +2,9 @@
 
 use bytes::{Bytes, BytesMut};
 use std::{
-    cell::Cell,
+    future::{self, Future},
     io::{Error, ErrorKind, Result},
+    pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
     time::Duration,
@@ -15,7 +16,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use webusb_web::{OpenUsbDevice, UsbControlRequest, UsbDevice, UsbDirection, UsbRecipient, UsbRequestType};
 
 use super::{guard::InUseGuard, UpcReceiver, UpcSender};
-use crate::{Class, CTRL_REQ_CLOSE, CTRL_REQ_INFO, CTRL_REQ_OPEN, INFO_SIZE, MAX_SIZE};
+use crate::{ctrl_req, notify, Class, INFO_SIZE, MAX_SIZE};
 
 pub(crate) fn to_io_err(error: webusb_web::Error) -> Error {
     let kind = match error.kind() {
@@ -83,13 +84,85 @@ pub async fn info(hnd: &OpenUsbDevice, interface: u8) -> Result<Vec<u8>> {
     let req = UsbControlRequest::new(
         UsbRequestType::Vendor,
         UsbRecipient::Interface,
-        CTRL_REQ_INFO,
+        ctrl_req::INFO,
         0,
         interface.into(),
     );
     let info = hnd.control_transfer_in(&req, INFO_SIZE as _).await.map_err(to_io_err)?;
 
     Ok(info)
+}
+
+/// Tracks half-close state and sends control requests when each direction closes.
+struct HalfCloseHandle {
+    hnd: Rc<OpenUsbDevice>,
+    iface: u8,
+    send_closed: bool,
+    recv_closed: bool,
+}
+
+impl HalfCloseHandle {
+    fn new(hnd: Rc<OpenUsbDevice>, iface: u8) -> Self {
+        Self { hnd, iface, send_closed: false, recv_closed: false }
+    }
+
+    /// Mark send direction as closed.
+    ///
+    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_SEND.
+    /// If false (device-initiated close via notification), no control request is sent.
+    async fn close_send(&mut self, notify_device: bool) {
+        if !self.send_closed {
+            self.send_closed = true;
+            if notify_device {
+                tracing::debug!("host send closed, sending CTRL_REQ_CLOSE_SEND");
+                let control = UsbControlRequest::new(
+                    UsbRequestType::Vendor,
+                    UsbRecipient::Interface,
+                    ctrl_req::CLOSE_SEND,
+                    0,
+                    self.iface.into(),
+                );
+                if let Err(err) = self.hnd.control_transfer_out(&control, &[]).await {
+                    tracing::warn!("sending CTRL_REQ_CLOSE_SEND failed: {err}");
+                }
+            } else {
+                tracing::debug!("send direction closed (device-initiated)");
+            }
+            self.close_if_both().await;
+        }
+    }
+
+    /// Mark receive direction as closed.
+    ///
+    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_RECV.
+    /// If false (device-initiated close via notification), no control request is sent.
+    async fn close_recv(&mut self, notify_device: bool) {
+        if !self.recv_closed {
+            self.recv_closed = true;
+            if notify_device {
+                tracing::debug!("host recv closed, sending CTRL_REQ_CLOSE_RECV");
+                let control = UsbControlRequest::new(
+                    UsbRequestType::Vendor,
+                    UsbRecipient::Interface,
+                    ctrl_req::CLOSE_RECV,
+                    0,
+                    self.iface.into(),
+                );
+                if let Err(err) = self.hnd.control_transfer_out(&control, &[]).await {
+                    tracing::warn!("sending CTRL_REQ_CLOSE_RECV failed: {err}");
+                }
+            } else {
+                tracing::debug!("recv direction closed (device-initiated)");
+            }
+            self.close_if_both().await;
+        }
+    }
+
+    async fn close_if_both(&mut self) {
+        if self.send_closed && self.recv_closed {
+            close(&self.hnd, self.iface).await;
+        }
+    }
 }
 
 pub(crate) struct UpcShared {
@@ -120,6 +193,7 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
     // Get endpoints.
     let mut ep_in = None;
     let mut ep_out = None;
+    let mut ep_notify = None;
     let mut max_packet_size = usize::MAX;
     {
         let Some(cfg) = dev.configuration() else {
@@ -130,10 +204,20 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
         };
         let alt = &iface_desc.alternate;
         for ep in &alt.endpoints {
-            max_packet_size = max_packet_size.min(ep.packet_size as _);
-            match ep.direction {
-                UsbDirection::In => ep_in = Some(ep.endpoint_number),
-                UsbDirection::Out => ep_out = Some(ep.endpoint_number),
+            use webusb_web::UsbEndpointType;
+            match (ep.direction, ep.endpoint_type) {
+                (UsbDirection::In, UsbEndpointType::Bulk) => {
+                    max_packet_size = max_packet_size.min(ep.packet_size as _);
+                    ep_in = Some(ep.endpoint_number);
+                }
+                (UsbDirection::Out, UsbEndpointType::Bulk) => {
+                    max_packet_size = max_packet_size.min(ep.packet_size as _);
+                    ep_out = Some(ep.endpoint_number);
+                }
+                (UsbDirection::In, UsbEndpointType::Interrupt) => {
+                    ep_notify = Some(ep.endpoint_number);
+                }
+                _ => {}
             }
         }
     }
@@ -152,7 +236,7 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
     let control = UsbControlRequest::new(
         UsbRequestType::Vendor,
         UsbRecipient::Interface,
-        CTRL_REQ_CLOSE,
+        ctrl_req::CLOSE,
         0,
         interface.into(),
     );
@@ -161,25 +245,35 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
     // Start handler tasks.
     let error = Arc::new(Mutex::new(None));
     let name = format!("{}:{}", dev.serial_number().unwrap_or_default(), interface);
-    let closed = Rc::new(Cell::new(false));
+    let half_close = Arc::new(tokio::sync::Mutex::new(HalfCloseHandle::new(hnd.clone(), interface)));
 
     let hnd_in = hnd.clone();
     let error_in = error.clone();
     let (tx_in, mut rx_in) = mpsc::channel(16);
-    let in_closed = closed.clone();
     let in_guard = guard.clone();
+    let half_close_in = half_close.clone();
     spawn_local(async move {
         let _in_guard = in_guard;
-        in_task(hnd_in, tx_in, ep_in, interface, error_in, max_transfer_size, in_closed).await;
+        in_task(hnd_in, tx_in, ep_in, error_in, max_transfer_size, half_close_in).await;
     });
+
+    let device_close_recv: Pin<Box<dyn Future<Output = ()>>> = if let Some(ep_notify_num) = ep_notify {
+        Box::pin(notify_task(hnd.clone(), ep_notify_num))
+    } else {
+        tracing::debug!("no interrupt notification endpoint found, using STALL-only detection");
+        Box::pin(future::pending())
+    };
 
     let hnd_out = hnd.clone();
     let (tx_out, rx_out) = mpsc::channel(16);
     let error_out = error.clone();
     let (stop_tx, stop_rx) = oneshot::channel();
+    let half_close_out = half_close.clone();
+    let out_guard = guard.clone();
     spawn_local(async move {
-        let _out_guard = guard;
-        out_task(hnd_out, rx_out, ep_out, interface, error_out, stop_rx, max_packet_size, closed).await;
+        let _out_guard = out_guard;
+        out_task(hnd_out, rx_out, ep_out, error_out, stop_rx, max_packet_size, half_close_out, device_close_recv)
+            .await;
     });
 
     // Flush receive buffer.
@@ -196,7 +290,7 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
     let control = UsbControlRequest::new(
         UsbRequestType::Vendor,
         UsbRecipient::Interface,
-        CTRL_REQ_OPEN,
+        ctrl_req::OPEN,
         0,
         interface.into(),
     );
@@ -212,13 +306,13 @@ pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Res
 }
 
 async fn in_task(
-    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<Bytes>, ep: u8, iface: u8,
-    error: Arc<Mutex<Option<webusb_web::Error>>>, max_transfer_size: usize, closed: Rc<Cell<bool>>,
+    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<Bytes>, ep: u8, error: Arc<Mutex<Option<webusb_web::Error>>>,
+    max_transfer_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
 ) {
-    loop {
+    let host_initiated = loop {
         let res = tokio::select! {
             biased;
-            () = tx.closed() => break,
+            () = tx.closed() => break true,
             res = hnd.transfer_in(ep, max_transfer_size as _) => res,
         };
 
@@ -227,70 +321,110 @@ async fn in_task(
                 #[cfg(feature = "trace-packets")]
                 tracing::trace!("Received packet of {} bytes", buf.len());
                 if tx.send(Bytes::from(buf).into()).await.is_err() {
-                    break;
+                    break true;
                 }
+            }
+            Err(err) if err.kind() == webusb_web::ErrorKind::Stall => {
+                // Device halted the IN endpoint — clean half-close signal.
+                tracing::debug!("device halted IN endpoint (done sending)");
+                break false;
             }
             Err(err) => {
                 tracing::warn!("receiving failed: {err}");
                 *error.lock().unwrap() = Some(err);
-                break;
+                break false;
             }
         }
-    }
+    };
 
-    if !closed.replace(true) {
-        close(&hnd, iface).await;
-    }
+    half_close.lock().await.close_recv(host_initiated).await;
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn out_task(
-    hnd: Rc<OpenUsbDevice>, mut rx: mpsc::Receiver<Bytes>, ep: u8, iface: u8,
-    error: Arc<Mutex<Option<webusb_web::Error>>>, mut stop_rx: oneshot::Receiver<()>, max_packet_size: usize,
-    closed: Rc<Cell<bool>>,
+    hnd: Rc<OpenUsbDevice>, mut rx: mpsc::Receiver<Bytes>, ep: u8, error: Arc<Mutex<Option<webusb_web::Error>>>,
+    mut stop_rx: oneshot::Receiver<()>, max_packet_size: usize,
+    half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>, mut device_close: Pin<Box<dyn Future<Output = ()>>>,
 ) {
-    'outer: while let Some(mut data) = rx.recv().await {
+    let host_initiated = 'outer: {
         loop {
-            match stop_rx.try_recv() {
-                Err(TryRecvError::Empty) => (),
-                _ => break 'outer,
-            }
+            let data = tokio::select! {
+                biased;
+                data = rx.recv() => data,
+                () = &mut device_close => {
+                    tracing::debug!("received device close-recv notification in out_task");
+                    break 'outer false;
+                }
+            };
+            let Some(mut data) = data else { break 'outer true };
 
-            match hnd.transfer_out(ep, &data).await {
-                Ok(n) if n as usize != data.len() => {
-                    #[cfg(feature = "trace-packets")]
-                    tracing::trace!("Sent packet of {n} bytes");
-                    let _ = data.split_to(n as usize);
+            loop {
+                match stop_rx.try_recv() {
+                    Err(TryRecvError::Empty) => (),
+                    _ => break 'outer false,
                 }
-                Ok(_) => {
-                    #[cfg(feature = "trace-packets")]
-                    tracing::trace!("Sent packet of {} bytes", data.len());
-                    if data.is_empty() || data.len() % max_packet_size != 0 {
-                        break;
-                    } else {
-                        // Send zero length packet to indicate end of transfer.
-                        data = Bytes::new();
+
+                match hnd.transfer_out(ep, &data).await {
+                    Ok(n) if n as usize != data.len() => {
+                        #[cfg(feature = "trace-packets")]
+                        tracing::trace!("Sent packet of {n} bytes");
+                        let _ = data.split_to(n as usize);
                     }
-                }
-                Err(err) => {
-                    tracing::warn!("sending failed: {err}");
-                    *error.lock().unwrap() = Some(err);
-                    break 'outer;
+                    Ok(_) => {
+                        #[cfg(feature = "trace-packets")]
+                        tracing::trace!("Sent packet of {} bytes", data.len());
+                        if data.is_empty() || data.len() % max_packet_size != 0 {
+                            break;
+                        } else {
+                            // Send zero length packet to indicate end of transfer.
+                            data = Bytes::new();
+                        }
+                    }
+                    Err(err) if err.kind() == webusb_web::ErrorKind::Stall => {
+                        // Device halted the OUT endpoint — clean half-close signal.
+                        tracing::debug!("device halted OUT endpoint (done receiving)");
+                        break 'outer false;
+                    }
+                    Err(err) => {
+                        tracing::warn!("sending failed: {err}");
+                        *error.lock().unwrap() = Some(err);
+                        break 'outer false;
+                    }
                 }
             }
         }
-    }
+    };
 
-    if !closed.replace(true) {
-        close(&hnd, iface).await;
-    }
+    half_close.lock().await.close_send(host_initiated).await;
 }
 
 async fn close(hnd: &OpenUsbDevice, iface: u8) {
     tracing::debug!("closing connection");
     let control =
-        UsbControlRequest::new(UsbRequestType::Vendor, UsbRecipient::Interface, CTRL_REQ_CLOSE, 0, iface.into());
+        UsbControlRequest::new(UsbRequestType::Vendor, UsbRecipient::Interface, ctrl_req::CLOSE, 0, iface.into());
     if let Err(err) = hnd.control_transfer_out(&control, &[]).await {
         tracing::warn!("closing connection failed: {err}");
+    }
+}
+
+async fn notify_task(hnd: Rc<OpenUsbDevice>, ep: u8) {
+    loop {
+        match hnd.transfer_in(ep, notify::MAX_PACKET_SIZE as _).await {
+            Ok(buf) => {
+                for &byte in &buf {
+                    match byte {
+                        notify::CLOSE_RECV => {
+                            tracing::debug!("received device close-recv notification");
+                            return;
+                        }
+                        other => tracing::warn!("unknown notification byte: {other:#x}"),
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("notification transfer failed: {err}");
+                return;
+            }
+        }
     }
 }

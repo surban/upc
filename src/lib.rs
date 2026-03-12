@@ -48,9 +48,26 @@ impl From<Class> for usb_gadget::Class {
     }
 }
 
+/// Vendor-specific control requests (host → device).
 #[allow(dead_code)]
-const CTRL_REQ_OPEN: u8 = 1;
+mod ctrl_req {
+    /// Open a connection.
+    pub const OPEN: u8 = 1;
+    /// Close the connection (both directions).
+    pub const CLOSE: u8 = 2;
+    /// Read device-provided information.
+    pub const INFO: u8 = 3;
+    /// Host is done sending (close send direction).
+    pub const CLOSE_SEND: u8 = 4;
+    /// Host is done receiving (close receive direction).
+    pub const CLOSE_RECV: u8 = 5;
+}
+
+/// Interrupt IN notification bytes (device → host).
 #[allow(dead_code)]
-const CTRL_REQ_CLOSE: u8 = 2;
-#[allow(dead_code)]
-const CTRL_REQ_INFO: u8 = 3;
+mod notify {
+    /// Device is done receiving (OUT direction closed).
+    pub const CLOSE_RECV: u8 = 5;
+    /// Maximum packet size for the notification interrupt endpoint.
+    pub const MAX_PACKET_SIZE: usize = 8;
+}

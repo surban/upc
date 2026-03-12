@@ -66,7 +66,7 @@ impl UpcSender {
                 .unwrap()
                 .clone()
                 .map(to_io_err)
-                .unwrap_or_else(|| Error::new(ErrorKind::BrokenPipe, "UPC task terminated"))),
+                .unwrap_or_else(|| Error::new(ErrorKind::BrokenPipe, "UPC channel closed"))),
         }
     }
 
@@ -136,10 +136,14 @@ impl UpcReceiver {
     ///
     /// ## Cancel safety
     /// If canceled, no data will have been removed from the receive queue.
-    pub async fn recv(&mut self) -> Result<Bytes> {
+    pub async fn recv(&mut self) -> Result<Option<Bytes>> {
         loop {
             let Some(packet) = self.rx.recv().await else {
-                return Err(Error::new(ErrorKind::BrokenPipe, "UPC channel closed"));
+                // Channel closed — check if there was an error or a clean half-close.
+                return match self.shared.error.lock().unwrap().clone() {
+                    Some(err) => Err(to_io_err(err)),
+                    None => Ok(None),
+                };
             };
 
             let packet_len = packet.len();
@@ -151,7 +155,7 @@ impl UpcReceiver {
             }
 
             if packet_len < self.max_transfer_size {
-                return Ok(take(&mut self.buffer).into());
+                return Ok(Some(take(&mut self.buffer).into()));
             }
         }
     }
@@ -165,9 +169,9 @@ impl UpcReceiver {
     pub fn into_stream(self) -> UpcStream {
         let stream = stream::try_unfold(self, |mut this| async move {
             match this.recv().await {
-                Ok(data) => Ok(Some((data, this))),
-                Err(err) if err.kind() == ErrorKind::ConnectionReset => Ok(None),
-                Err(err) => Err(Error::new(ErrorKind::ConnectionReset, err)),
+                Ok(Some(data)) => Ok(Some((data, this))),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
             }
         });
 
