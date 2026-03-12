@@ -1,5 +1,4 @@
-use rand::prelude::*;
-use rand_xoshiro::Xoshiro128StarStar;
+use rand::{prelude::*, rngs::SmallRng};
 use std::{collections::VecDeque, time::Duration};
 
 use upc::Class;
@@ -48,7 +47,7 @@ pub async fn sleep(duration: Duration) {
 }
 
 pub struct TestData {
-    rng: Xoshiro128StarStar,
+    rng: SmallRng,
     max_length: usize,
     pre_lengths: VecDeque<usize>,
 }
@@ -56,7 +55,7 @@ pub struct TestData {
 impl TestData {
     pub fn new(seed: u64, max_length: usize) -> Self {
         Self {
-            rng: Xoshiro128StarStar::seed_from_u64(seed),
+            rng: SmallRng::seed_from_u64(seed),
             max_length,
             pre_lengths: [
                 0,
@@ -104,12 +103,12 @@ impl TestData {
 }
 
 pub struct TestDelayer {
-    rng: Xoshiro128StarStar,
+    rng: SmallRng,
 }
 
 impl TestDelayer {
     pub fn new(seed: u64) -> Self {
-        Self { rng: Xoshiro128StarStar::seed_from_u64(seed) }
+        Self { rng: SmallRng::seed_from_u64(seed) }
     }
 
     pub async fn delay(&mut self) {

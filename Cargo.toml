@@ -24,7 +24,7 @@ trace-packets = []
 futures = "0.3"
 tokio = { version = "1.43", features = ["macros", "sync", "time"] }
 nusb = { version = "0.2", features = ["tokio"], optional = true }
-usb-gadget = { version = "0.7", features = ["tokio"], optional = true }
+usb-gadget = { version = "1", features = ["tokio"], optional = true }
 tracing = "0.1"
 uuid = "1.13"
 bytes = "1.4"
@@ -44,11 +44,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
 ] }
 tracing-log = "0.2"
-rand_xoshiro = "0.7"
-rand = "0.9"
+rand = "0.10"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3"
 web-sys = { version = "0.3", features = ["console", "Document", "HtmlElement"] }
 

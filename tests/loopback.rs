@@ -11,8 +11,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rand::prelude::*;
-use rand_xoshiro::Xoshiro128StarStar;
+use rand::{prelude::*, rngs::SmallRng};
 use tokio::{sync::oneshot, time::sleep};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
@@ -44,7 +43,7 @@ const GUID: uuid::Uuid = uuid!("3bf77270-42d2-42c6-a475-490227a9cc89");
 // ── Test-data helpers ────────────────────────────────────────────────────────
 
 struct TestData {
-    rng: Xoshiro128StarStar,
+    rng: SmallRng,
     max_length: usize,
     pre_lengths: std::collections::VecDeque<usize>,
 }
@@ -52,11 +51,11 @@ struct TestData {
 impl TestData {
     fn new(seed: u64, max_length: usize) -> Self {
         Self {
-            rng: Xoshiro128StarStar::seed_from_u64(seed),
+            rng: SmallRng::seed_from_u64(seed),
             max_length,
             pre_lengths: [
-                0, 1, 2, 3, 511, 512, 513, 1023, 1024, 1025, 0, 2000, 2048, 0, 4096, 5000,
-                8191, 8192, 8193, 0, 8193,
+                0, 1, 2, 3, 511, 512, 513, 1023, 1024, 1025, 0, 2000, 2048, 0, 4096, 5000, 8191, 8192, 8193, 0,
+                8193,
             ]
             .into(),
         }
@@ -85,10 +84,7 @@ fn init_log() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        tracing_subscriber::registry()
-            .with(fmt::layer())
-            .with(EnvFilter::from_default_env())
-            .init();
+        tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
         tracing_log::LogTracer::init().unwrap();
     });
 }
@@ -106,22 +102,16 @@ async fn loopback() {
     sleep(Duration::from_secs(1)).await;
 
     println!("[loopback] Creating UPC function (device side)…");
-    let (mut upc_fn, hnd) = UpcFunction::new(
-        InterfaceId::new(CLASS)
-            .with_name("USB LOOPBACK TEST")
-            .with_guid(GUID),
-    );
+    let (mut upc_fn, hnd) =
+        UpcFunction::new(InterfaceId::new(CLASS).with_name("USB LOOPBACK TEST").with_guid(GUID));
     upc_fn.set_info(INFO.to_vec()).await;
 
     println!("[loopback] Registering gadget…");
     let udc = default_udc().expect("cannot get UDC");
-    let mut gadget = Gadget::new(
-        DEVICE_CLASS.into(),
-        Id::new(VID, PID),
-        Strings::new("upc-loopback", "test", "0"),
-    )
-    .with_config(Config::new("config").with_function(hnd))
-    .with_os_descriptor(OsDescriptor::microsoft());
+    let mut gadget =
+        Gadget::new(DEVICE_CLASS.into(), Id::new(VID, PID), Strings::new("upc-loopback", "test", "0"))
+            .with_config(Config::new("config").with_function(hnd))
+            .with_os_descriptor(OsDescriptor::microsoft());
     gadget.device_release = 0x0110;
     let reg = gadget.bind(&udc).expect("cannot bind to UDC");
     assert!(reg.is_attached(), "gadget is not attached");
@@ -167,10 +157,7 @@ async fn loopback() {
         for n in 0..TEST_PACKETS {
             let data = tx_td.generate();
             let len = data.len();
-            dev_tx
-                .send(Bytes::from(data))
-                .await
-                .expect("device send failed");
+            dev_tx.send(Bytes::from(data)).await.expect("device send failed");
             total += len;
             if n % 50 == 0 {
                 println!("[device-tx] packet {n}: {len} bytes");
@@ -226,16 +213,11 @@ async fn loopback() {
     println!("[host] Getting info…");
     let dev = dev_info.open().await.expect("cannot open device");
     let dev_info_data = info(&dev, iface_num).await.expect("cannot get info");
-    println!(
-        "[host] Info: {}",
-        String::from_utf8_lossy(&dev_info_data)
-    );
+    println!("[host] Info: {}", String::from_utf8_lossy(&dev_info_data));
     assert_eq!(dev_info_data, INFO, "info mismatch");
 
     println!("[host] Connecting…");
-    let (host_tx, mut host_rx) = connect(dev, iface_num, TOPIC)
-        .await
-        .expect("host connect failed");
+    let (host_tx, mut host_rx) = connect(dev, iface_num, TOPIC).await.expect("host connect failed");
 
     // Channel so we know the host receiver is done with all data packets
     // before we drop the sender.
@@ -281,10 +263,7 @@ async fn loopback() {
     for n in 0..TEST_PACKETS {
         let data = tx_td.generate();
         let len = data.len();
-        host_tx
-            .send(Bytes::from(data))
-            .await
-            .expect("host send failed");
+        host_tx.send(Bytes::from(data)).await.expect("host send failed");
         total += len;
         if n % 50 == 0 {
             println!("[host-tx] packet {n}: {len} bytes");
@@ -292,10 +271,7 @@ async fn loopback() {
     }
 
     let elapsed = start.elapsed().as_secs_f32();
-    println!(
-        "[host-tx] Sent {total} bytes in {elapsed:.2}s ({:.2} MB/s)",
-        total as f32 / elapsed / 1_048_576.
-    );
+    println!("[host-tx] Sent {total} bytes in {elapsed:.2}s ({:.2} MB/s)", total as f32 / elapsed / 1_048_576.);
 
     // Wait for host receiver to finish validating all packets.
     rx_done_rx.await.unwrap();
