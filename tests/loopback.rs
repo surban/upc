@@ -178,9 +178,9 @@ async fn loopback() {
         drop(dev_tx);
         println!("[device] Done");
 
-        // Keep registration alive so the gadget stays connected.
-        // `reg` is moved into this task below, but we still need it live.
-        reg
+        // Keep registration and upc_fn alive so the gadget stays connected
+        // and the device task can still respond on the endpoints.
+        (reg, upc_fn)
     });
 
     // ------------------------------------------------------------------
@@ -286,8 +286,9 @@ async fn loopback() {
     // 4. Wait for the device side to finish
     // ------------------------------------------------------------------
     println!("[loopback] Waiting for device task…");
-    let _reg = device_task.await.unwrap();
-    // Keep `_reg` alive until here so the gadget stays registered.
+    let (_reg, _upc_fn) = device_task.await.unwrap();
+    // Keep `_reg` and `_upc_fn` alive until here so the gadget stays
+    // registered and the device task can process the clean shutdown.
 
     sleep(Duration::from_secs(1)).await;
     println!("[loopback] ✅ Loopback test passed!");

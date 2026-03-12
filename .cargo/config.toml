@@ -1,3 +1,15 @@
+[target.i686-unknown-linux-gnu]
+runner = 'sudo -E'
+
+[target.x86_64-unknown-linux-gnu]
+runner = 'sudo -E'
+
+[target.armv7-unknown-linux-gnueabihf]
+runner = 'sudo -E'
+
+[target.aarch64-unknown-linux-gnu]
+runner = 'sudo -E'
+
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg=web_sys_unstable_apis", "--cfg=getrandom_backend=\"wasm_js\""]
 runner = "wasm-bindgen-test-runner"
