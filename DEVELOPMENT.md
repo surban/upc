@@ -4,10 +4,54 @@ Development
 Testing
 -------
 
-### Native tests
+### Loopback test with dummy_hcd (VM-based)
 
-Testing requires two machines connected via USB: a Linux device with USB gadget
-support running the device side, and a host machine running the host side.
+The loopback integration test runs both the USB device and host sides inside
+a QEMU VM using the kernel's `dummy_hcd` driver (virtual USB host controller).
+No real USB hardware is needed.
+
+**Prerequisites**
+
+1. Install [virtme-ng](https://github.com/arighi/virtme-ng):
+
+       pip3 install --user virtme-ng
+
+2. Install QEMU and zstd:
+
+       sudo apt-get install qemu-system-x86 zstd busybox-static
+
+3. Build the kernel tarball (only needed once; cached afterward):
+
+       .misc/build-kernel.sh
+
+   This downloads and builds a Linux kernel with USB gadget support.
+   The resulting tarball is saved to `.misc/kernel-*.tar.zst`.
+
+   Building the kernel also requires standard kernel build deps:
+
+       sudo apt-get install build-essential flex bison libelf-dev libssl-dev bc
+
+**Running the test**
+
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=".misc/cargo-test-runner.sh" \
+        cargo test --release --features host,device -- --nocapture
+
+The cargo test runner script boots a VM, loads the USB gadget modules, and
+executes the test binary inside it. The VM shares the host filesystem via
+virtme-ng, so no separate rootfs image is needed.
+
+### Native loopback test (real hardware)
+
+If the machine has a USB Device Controller (UDC) connected back to one of its
+own USB host ports via a loopback cable, you can run the loopback integration
+test directly without a VM:
+
+    cargo test --release --test loopback --features host,device -- --nocapture
+
+### Native tests with two machines
+
+Testing with two separate machines requires a USB cable connecting a Linux
+device with USB gadget support to a host machine.
 
 1. On the **Linux gadget device**, start the device example:
 

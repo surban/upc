@@ -51,45 +51,59 @@ tool for transferring data over USB.
 
 Install it with:
 
-    cargo install upc --features cli,host         # host side only
-    cargo install upc --features cli,device       # device side only
-    cargo install upc --features cli,host,device  # both
+```console
+cargo install upc --features cli,host         # host side only
+cargo install upc --features cli,device       # device side only
+cargo install upc --features cli,host,device  # both
+```
 
 ### Device side
 
 Start a USB gadget and wait for a connection (requires root and a UDC):
 
-    upc device
+```console
+upc device
+```
 
 This creates a USB gadget with default VID/PID and waits for a host to connect.
 Data received from the host is written to stdout; data read from stdin is sent
 to the host. Customize with options:
 
-    upc device --serial "my-device" --info "sensor v1" --subclass 01
+```console
+upc device --serial "my-device" --info "sensor v1" --subclass 01
+```
 
 ### Host side
 
 Probe for connected UPC devices:
 
-    upc probe
+```console
+upc probe
+```
 
 This outputs one tab-separated line per UPC interface:
 
-    1209:0001	001:005	my-device	0	01	sensor v1
+```text
+1209:0001	001:005	my-device	0	01	sensor v1
+```
 
 The columns are: VID:PID, bus:address, serial, interface, subclass, info.
 Use `--all` for a human-readable listing of all USB devices.
 
 Connect to a UPC device and forward stdin/stdout:
 
-    upc connect
+```console
+upc connect
+```
 
 If multiple UPC devices are connected, narrow down with filters:
 
-    upc connect --serial "my-device"
-    upc connect --vid 1209 --pid 0001
-    upc connect --subclass 01
-    upc connect --bus 1 --address 5
+```console
+upc connect --serial "my-device"
+upc connect --vid 1209 --pid 0001
+upc connect --subclass 01
+upc connect --bus 1 --address 5
+```
 
 ### Framing
 
@@ -100,8 +114,10 @@ Use `--framing raw` for binary data where each read becomes a packet.
 
 Set `RUST_LOG` to enable diagnostic output on stderr:
 
-    RUST_LOG=debug upc connect
-    RUST_LOG=upc=trace upc device
+```console
+RUST_LOG=debug upc connect
+RUST_LOG=upc=trace upc device
+```
 
 License
 -------

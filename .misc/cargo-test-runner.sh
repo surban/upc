@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#
+# Cargo test runner that executes test binaries inside a virtme-ng VM
+# with dummy_hcd USB gadget support.
+#
+# Cargo invokes this as:
+#   .misc/cargo-test-runner.sh <test-binary> [args...]
+#
+# Setup (one of):
+#   1. Set via environment:
+#        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=".misc/cargo-test-runner.sh"
+#
+#   2. Set in .cargo/config.toml:
+#        [target.x86_64-unknown-linux-gnu]
+#        runner = ".misc/cargo-test-runner.sh"
+#
+# The kernel tarball (built by .misc/build-kernel.sh) is located automatically
+# from .misc/kernel-*.tar.zst, or set KERNEL_TARBALL=/path/to/tarball.
+#
+# On first invocation the tarball is extracted to a staging directory that
+# is reused for subsequent invocations (within the same tmpdir lifetime).
+#
+# Environment variables matching UPC_* and RUST_* are forwarded
+# into the VM.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TEST_BINARY="$1"
+shift
+
+# ─── Locate kernel tarball ────────────────────────────────────────────
+
+if [ -z "${KERNEL_TARBALL:-}" ]; then
+    KERNEL_TARBALL="$(ls -t "$SCRIPT_DIR"/kernel-*.tar.zst 2>/dev/null | head -1 || true)"
+fi
+
+if [ -z "$KERNEL_TARBALL" ] || [ ! -f "$KERNEL_TARBALL" ]; then
+    echo "ERROR: no kernel tarball found." >&2
+    echo "Build one with: .misc/build-kernel.sh" >&2
+    echo "Or set KERNEL_TARBALL=/path/to/kernel-*.tar.zst" >&2
+    exit 1
+fi
+
+# ─── Extract tarball (once, reused across invocations) ────────────────
+
+STAGING="${KERNEL_STAGING:-/tmp/ci-kernel-runner}"
+
+if [ ! -f "$STAGING/boot/bzImage" ]; then
+    mkdir -p "$STAGING"
+    tar -I zstd -xf "$KERNEL_TARBALL" -C "$STAGING"
+fi
+
+BZIMAGE="$STAGING/boot/bzImage"
+
+# ─── Build the in-VM init script ─────────────────────────────────────
+#
+# We write a small script that:
+#   1. Exports forwarded environment variables.
+#   2. Loads USB gadget kernel modules.
+#   3. Runs the test binary with the original arguments.
+#
+# This is passed to vng --exec and runs as the VM's init task.
+
+INIT_SCRIPT="$(mktemp /tmp/ci-vm-init.XXXXXX.sh)"
+trap 'rm -f "$INIT_SCRIPT"' EXIT
+
+# Forward UPC_* and RUST_* environment variables into the VM.
+{
+    echo '#!/bin/bash'
+    echo 'set -euo pipefail'
+    echo ''
+    echo '# Forwarded environment variables from host.'
+    while IFS='=' read -r key value; do
+        case "$key" in
+            UPC_*|RUST_*)
+                printf 'export %s=%q\n' "$key" "$value"
+                ;;
+        esac
+    done < <(env)
+
+    cat <<'INITEOF'
+
+# Load USB gadget modules.
+modprobe configfs
+modprobe libcomposite
+modprobe dummy_hcd is_super_speed=Y
+
+for m in usb_f_fs; do
+    modprobe "$m" 2>/dev/null || true
+done
+
+# Run the test binary.
+exec "$@"
+INITEOF
+} > "$INIT_SCRIPT"
+chmod +x "$INIT_SCRIPT"
+
+# ─── Launch VM and run the test ───────────────────────────────────────
+
+exec vng \
+    --run "$BZIMAGE" \
+    --rw \
+    --cpus "${VM_CPUS:-$(nproc 2>/dev/null || echo 4)}" \
+    --memory "${VM_MEMORY:-4G}" \
+    --exec "$INIT_SCRIPT $TEST_BINARY $*"
