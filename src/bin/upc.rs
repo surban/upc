@@ -10,6 +10,7 @@ compile_error!("The `cli` feature requires at least one of `host` or `device` fe
 
 use std::{
     io::{self, Write},
+    pin::pin,
     process::ExitCode,
 };
 
@@ -28,6 +29,7 @@ const DEFAULT_GUID: &str = "19840902-89fc-40d8-bc10-f71079b789b5";
 /// Trait abstracting over host and device UPC senders.
 trait UpcSend {
     fn upc_send(&self, data: Bytes) -> impl std::future::Future<Output = io::Result<()>> + Send;
+    fn upc_closed(&self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// Trait abstracting over host and device UPC receivers.
@@ -39,6 +41,9 @@ trait UpcRecv {
 impl UpcSend for upc::host::UpcSender {
     async fn upc_send(&self, data: Bytes) -> io::Result<()> {
         self.send(data).await
+    }
+    async fn upc_closed(&self) {
+        self.closed().await
     }
 }
 
@@ -54,6 +59,9 @@ impl UpcSend for upc::device::UpcSender {
     async fn upc_send(&self, data: Bytes) -> io::Result<()> {
         self.send(data).await
     }
+    async fn upc_closed(&self) {
+        self.closed().await
+    }
 }
 
 #[cfg(feature = "device")]
@@ -65,6 +73,38 @@ impl UpcRecv for upc::device::UpcReceiver {
 
 // ---- Shared stdio forwarding ----
 
+/// Close the process's stdin file descriptor / handle.
+///
+/// This signals broken pipe to any process piping into us.
+fn close_stdin() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        drop(unsafe { OwnedFd::from_raw_fd(io::stdin().as_raw_fd()) });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        drop(unsafe { OwnedHandle::from_raw_handle(io::stdin().as_raw_handle()) });
+    }
+}
+
+/// Close the process's stdout file descriptor / handle.
+///
+/// This signals EOF to any process reading our output.
+fn close_stdout() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        drop(unsafe { OwnedFd::from_raw_fd(io::stdout().as_raw_fd()) });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        drop(unsafe { OwnedHandle::from_raw_handle(io::stdout().as_raw_handle()) });
+    }
+}
+
 /// Forward data between stdin/stdout and a UPC channel.
 async fn forward_stdio(
     tx: impl UpcSend + Send + 'static, mut rx: impl UpcRecv + Send + 'static, max_packet: usize, framing: Framing,
@@ -73,29 +113,46 @@ async fn forward_stdio(
     let stdout = io::stdout();
 
     let send_task = tokio::spawn(async move {
+        let closed = pin!(tx.upc_closed());
         match framing {
             Framing::Line => {
                 let mut lines = BufReader::new(stdin).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.upc_send(Bytes::from(line)).await.is_err() {
-                        break;
+                let mut closed = closed;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = &mut closed => break,
+                        line = lines.next_line() => match line {
+                            Ok(Some(line)) => {
+                                if tx.upc_send(Bytes::from(line)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        },
                     }
                 }
             }
             Framing::Raw => {
                 let mut buf = vec![0u8; max_packet];
+                let mut closed = closed;
                 loop {
-                    let n = match stdin.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
-                    if tx.upc_send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                        break;
+                    tokio::select! {
+                        biased;
+                        () = &mut closed => break,
+                        result = stdin.read(&mut buf) => match result {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if tx.upc_send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                                    break;
+                                }
+                            }
+                        },
                     }
                 }
             }
         }
+        close_stdin();
     });
 
     let recv_task = tokio::spawn(async move {
@@ -110,10 +167,10 @@ async fn forward_stdio(
                 Ok(None) | Err(_) => break,
             }
         }
+        close_stdout();
     });
 
-    let _ = send_task.await;
-    let _ = recv_task.await;
+    let _ = tokio::join!(send_task, recv_task);
 }
 
 // ---- Argument parsing helpers ----
