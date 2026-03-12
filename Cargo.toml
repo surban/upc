@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 tracing-log = "0.2"
 rand = "0.10"
+serial_test = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }

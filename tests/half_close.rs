@@ -10,11 +10,11 @@
 #![cfg(all(feature = "host", feature = "device"))]
 
 use std::time::Duration;
-
 use bytes::Bytes;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
+use serial_test::serial;
 
 use upc::{
     device::{InterfaceId, UpcFunction},
@@ -102,6 +102,7 @@ async fn host_connect(
 // ── Test 1: Host drops sender, device can still send ────────────────────────
 
 #[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn host_close_send() {
     init_log();
     let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("host_close_send").await;
@@ -151,6 +152,7 @@ async fn host_close_send() {
 // ── Test 2: Host drops receiver, device can still receive ───────────────────
 
 #[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn host_close_recv() {
     init_log();
     let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("host_close_recv").await;
@@ -203,6 +205,7 @@ async fn host_close_recv() {
 // ── Test 3: Device drops sender, host recv gets EOF ─────────────────────────
 
 #[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn device_close_send() {
     init_log();
     let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("device_close_send").await;
@@ -258,6 +261,7 @@ async fn device_close_send() {
 // ── Test 4: Device drops receiver, host send gets error ─────────────────────
 
 #[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn device_close_recv() {
     init_log();
     let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("device_close_recv").await;
@@ -318,6 +322,7 @@ async fn device_close_recv() {
 // ── Test 5: Device drops receiver, host detects via closed() without sending ─
 
 #[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn device_close_recv_notify() {
     init_log();
     let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("device_close_recv_notify").await;

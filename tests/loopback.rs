@@ -9,13 +9,13 @@
 #![cfg(all(feature = "host", feature = "device"))]
 
 use std::time::{Duration, Instant};
-
 use bytes::Bytes;
 use rand::{prelude::*, rngs::SmallRng};
 use tokio::{sync::oneshot, time::sleep};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
 use uuid::uuid;
+use serial_test::serial;
 
 use upc::{
     device::{InterfaceId, UpcFunction},
@@ -92,6 +92,7 @@ fn init_log() {
 // ── The actual loopback test ─────────────────────────────────────────────────
 
 #[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn loopback() {
     init_log();
 
