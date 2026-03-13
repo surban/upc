@@ -197,6 +197,9 @@ async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing)
                 Ok(Some(data)) => {
                     let mut stdout = stdout.lock();
                     if let Err(err) = stdout.write_all(&data).and_then(|_| stdout.flush()) {
+                        if is_broken_pipe(&err) {
+                            break Ok(());
+                        }
                         break Err(err);
                     }
                 }
