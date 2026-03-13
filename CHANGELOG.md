@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+## 0.9.0 - 2026-03-13
+### Added
+- half-close support: either side can independently close its send or receive direction
+- `UpcSender::closed()` and device `UpcFunctionSender::closed()` notify when the remote side closes its receive direction
+- `UpcReceiver::recv()` / `UpcFunctionReceiver::recv()` return `Ok(None)` on clean half-close EOF
+- `connect_with()` for host (native and web) accepting `UpcOptions` for advanced connection settings
+- `UpcOptions` builder with `with_topic()` and `with_ping_interval()` methods
+- periodic ping/status mechanism with configurable timeout to detect hung peers
+- `UpcFunction::set_ping_timeout()` and `UpcFunction::ping_timeout()` on device side
+- `upc` CLI tool with `probe`, `connect`, and `device` subcommands (feature `cli`)
+- retry logic for claiming USB interface on connect
+
+### Changed
+- **Breaking:** `UpcReceiver::recv()` returns `Result<Option<Bytes>>` instead of `Result<Bytes>`
+- **Breaking:** `UpcFunctionReceiver::recv()` returns `Result<Option<BytesMut>>` instead of `Result<BytesMut>`
+
 ## 0.8.1 - 2025-07-28
 ### Fixed
 - docs
