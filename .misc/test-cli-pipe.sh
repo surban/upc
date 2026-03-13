@@ -181,6 +181,51 @@ if ! wait_gadget; then kill_wait $dp; fail "gadget timeout"; else
 fi
 rm -f "$host_out"; wait_no_gadget || true
 
+# -- 8. Device stdout closed early (broken pipe) --
+echo -n "  8. Device stdout closed early (no deadlock) ... "
+(
+    "$UPC" device --info t8 --framing raw </dev/null 2>/dev/null | head -c 1 >/dev/null
+) &
+dp=$!
+if ! wait_gadget; then kill_wait $dp; fail "gadget timeout"; else
+    (yes 2>/dev/null || true) | "$UPC" connect --topic t8 --framing raw >/dev/null 2>/dev/null
+    if ! wait_exit $dp 15; then kill_wait $dp; fail "device deadlock"
+    else pass; fi
+fi
+wait_no_gadget || true
+
+# -- 9. Bidirectional raw transfer --
+echo -n "  9. Bidirectional raw transfer ... "
+dev_out=$(mktemp); host_out=$(mktemp)
+printf 'from-device' | "$UPC" device --info t9 --framing raw >"$dev_out" 2>/dev/null &
+dp=$!
+if ! wait_gadget; then kill_wait $dp; fail "gadget timeout"; else
+    printf 'from-host' | "$UPC" connect --topic t9 --framing raw >"$host_out" 2>/dev/null
+    if ! wait_exit $dp 15; then kill_wait $dp; fail "device deadlock"; else
+        d=$(cat "$dev_out"); h=$(cat "$host_out")
+        if [ "$d" = "from-host" ] && [ "$h" = "from-device" ]; then pass
+        else fail "got d='$(echo "$d" | cat -v)' h='$(echo "$h" | cat -v)'"; fi
+    fi
+fi
+rm -f "$dev_out" "$host_out"; wait_no_gadget || true
+
+# -- 10. Large line-mode transfer --
+echo -n " 10. Large line-mode transfer ... "
+dev_in=$(mktemp); host_in=$(mktemp)
+dev_out=$(mktemp); host_out=$(mktemp)
+seq 1 5000 | sed 's/^/D/' > "$dev_in"
+seq 1 5000 | sed 's/^/H/' > "$host_in"
+"$UPC" device --info t10 <"$dev_in" >"$dev_out" 2>/dev/null &
+dp=$!
+if ! wait_gadget; then kill_wait $dp; fail "gadget timeout"; else
+    "$UPC" connect --topic t10 <"$host_in" >"$host_out" 2>/dev/null
+    if ! wait_exit $dp 15; then kill_wait $dp; fail "device deadlock"; else
+        if cmp -s "$host_in" "$dev_out" && cmp -s "$dev_in" "$host_out"; then pass
+        else fail "data mismatch (dev_in=$(wc -c <"$dev_in")B host_in=$(wc -c <"$host_in")B dev_out=$(wc -c <"$dev_out")B host_out=$(wc -c <"$host_out")B)"; fi
+    fi
+fi
+rm -f "$dev_in" "$host_in" "$dev_out" "$host_out"; wait_no_gadget || true
+
 # -- Summary --
 echo ""
 total=$((PASS + FAIL))
