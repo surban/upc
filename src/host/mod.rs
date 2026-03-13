@@ -28,6 +28,8 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+use crate::channel_error;
+
 #[cfg(feature = "web")]
 mod guard;
 #[cfg(feature = "web")]
@@ -57,12 +59,13 @@ pub(crate) struct DeviceStatus {
 pub struct UpcOptions {
     pub(crate) topic: Vec<u8>,
     pub(crate) ping_interval: Option<Duration>,
+    pub(crate) max_size: usize,
 }
 
 impl UpcOptions {
     /// Creates a new set of default connection options.
     pub fn new() -> Self {
-        Self { topic: Vec::new(), ping_interval: Some(Duration::from_secs(5)) }
+        Self { topic: Vec::new(), ping_interval: Some(Duration::from_secs(5)), max_size: crate::MAX_SIZE }
     }
 
     /// Sets the topic data provided to the device.
@@ -95,6 +98,22 @@ impl UpcOptions {
     pub fn ping_interval(&self) -> Option<Duration> {
         self.ping_interval
     }
+
+    /// Sets the maximum receive packet size.
+    ///
+    /// This is advertised to the device via host capabilities
+    /// so that the device can enforce the limit on its send side.
+    ///
+    /// The default is [`crate::MAX_SIZE`].
+    pub fn with_max_size(mut self, max_size: usize) -> Self {
+        self.max_size = max_size;
+        self
+    }
+
+    /// Returns the maximum receive packet size.
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
 }
 
 impl Default for UpcOptions {
@@ -107,6 +126,7 @@ impl Default for UpcOptions {
 pub struct UpcSender {
     tx: mpsc::Sender<Bytes>,
     shared: Arc<UpcShared>,
+    max_size: usize,
 }
 
 impl fmt::Debug for UpcSender {
@@ -118,9 +138,18 @@ impl fmt::Debug for UpcSender {
 impl UpcSender {
     /// Send packet.
     ///
+    /// If the device has closed its receive direction (half-close),
+    /// this returns an error with [`ErrorKind::BrokenPipe`].
+    ///
     /// ## Cancel safety
     /// If canceled, no data will have been sent.
     pub async fn send(&self, data: Bytes) -> Result<()> {
+        if data.len() > self.max_size {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("packet size {} exceeds maximum of {}", data.len(), self.max_size),
+            ));
+        }
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
             Err(_) => Err(self
@@ -130,8 +159,13 @@ impl UpcSender {
                 .unwrap()
                 .clone()
                 .map(to_io_err)
-                .unwrap_or_else(|| Error::new(ErrorKind::BrokenPipe, "UPC channel closed"))),
+                .unwrap_or_else(|| channel_error(ErrorKind::BrokenPipe))),
         }
+    }
+
+    /// The maximum packet size accepted by the device.
+    pub fn max_size(&self) -> usize {
+        self.max_size
     }
 
     /// Wait until connection is closed.
@@ -224,9 +258,9 @@ impl UpcReceiver {
         }
     }
 
-    /// Sets the maximum packet size.
-    pub fn set_max_size(&mut self, max_size: usize) {
-        self.max_size = max_size;
+    /// The maximum receive packet size.
+    pub fn max_size(&self) -> usize {
+        self.max_size
     }
 
     /// Turns this into a stream of packets.

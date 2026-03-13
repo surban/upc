@@ -21,7 +21,7 @@ use tokio::{
 };
 
 use super::{DeviceStatus, UpcOptions, UpcReceiver, UpcSender};
-use crate::{ctrl_req, status, Capabilities, Class, INFO_SIZE, MAX_SIZE};
+use crate::{ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE};
 
 const TIMEOUT: Duration = Duration::from_secs(1);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -320,18 +320,25 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     tracing::debug!("querying capabilities");
     let caps = match iface
         .control_in(
-            control_in(ctrl_req::CAPABILITIES, 0, interface.into(), Capabilities::SIZE.try_into().unwrap()),
+            control_in(ctrl_req::CAPABILITIES, 0, interface.into(), DeviceCapabilities::SIZE.try_into().unwrap()),
             TIMEOUT,
         )
         .await
     {
-        Ok(data) => Capabilities::decode(&data)?,
+        Ok(data) => DeviceCapabilities::decode(&data)?,
         Err(err) => {
             tracing::debug!("capabilities query failed: {err}");
-            Capabilities::default()
+            DeviceCapabilities::default()
         }
     };
     tracing::debug!("device capabilities: {caps:?}");
+
+    // Send host capabilities.
+    tracing::debug!("sending host capabilities");
+    let host_caps = HostCapabilities { max_packet_size: options.max_size as u64 };
+    let _ = iface
+        .control_out(control_out(ctrl_req::CAPABILITIES, 0, interface.into(), &host_caps.encode()), TIMEOUT)
+        .await;
 
     // Determine status polling interval.
     let status_interval = if caps.status_supported {
@@ -381,9 +388,11 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     tokio::spawn(out_task(ep_out, rx_out, error_out, max_packet_size, half_close_out, status_rx));
 
     // Build objects.
+    let device_max_size = usize::try_from(caps.max_packet_size).unwrap_or(usize::MAX);
     let shared = Arc::new(UpcShared { name, error });
-    let sender = UpcSender { tx: tx_out, shared: shared.clone() };
-    let recv = UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: MAX_SIZE, max_transfer_size };
+    let sender = UpcSender { tx: tx_out, shared: shared.clone(), max_size: device_max_size };
+    let recv =
+        UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: options.max_size, max_transfer_size };
 
     Ok((sender, recv))
 }

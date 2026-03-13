@@ -3,7 +3,22 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-use std::time::Duration;
+use std::{
+    io::{Error, ErrorKind},
+    time::Duration,
+};
+
+/// Creates an I/O error for a closed UPC channel.
+///
+/// For [`ErrorKind::BrokenPipe`] this produces "UPC channel closed";
+/// for other kinds it uses the standard error text.
+pub(crate) fn channel_error(kind: ErrorKind) -> Error {
+    if kind == ErrorKind::BrokenPipe {
+        Error::new(kind, "UPC channel closed")
+    } else {
+        kind.into()
+    }
+}
 
 #[cfg(feature = "device")]
 pub mod device;
@@ -65,7 +80,7 @@ mod ctrl_req {
     pub const CLOSE_RECV: u8 = 5;
     /// Ping / status request (device responds with status bytes).
     pub const STATUS: u8 = 6;
-    /// Query device capabilities.
+    /// Query device capabilities (device-to-host) / set host capabilities (host-to-device).
     pub const CAPABILITIES: u8 = 7;
 }
 
@@ -78,62 +93,24 @@ mod status {
     pub const MAX_SIZE: usize = 8;
 }
 
-/// Device capabilities.
-///
-/// Encoded using a TLV (tag-length-value) format for forward and backward
-/// compatibility: unknown tags are silently skipped during decoding and
-/// missing tags fall back to their default values.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Capabilities {
-    /// Ping timeout duration.
-    pub ping_timeout: Option<Duration>,
-    /// Whether the device supports the STATUS control request.
-    pub status_supported: bool,
-}
+/// TLV (tag-length-value) encoding helpers for capabilities.
+#[allow(dead_code)]
+mod tlv {
+    use std::io::{Error, ErrorKind};
 
-impl Default for Capabilities {
-    fn default() -> Self {
-        Self { ping_timeout: None, status_supported: false }
-    }
-}
-
-impl Capabilities {
-    /// Maximum encoded capabilities size.
-    #[cfg(any(feature = "host", feature = "web"))]
-    const SIZE: usize = 256;
-
-    /// TLV tag for ping timeout.
-    const TAG_PING_TIMEOUT: u8 = 0x01;
-    /// TLV tag for status supported.
-    const TAG_STATUS_SUPPORTED: u8 = 0x02;
-
-    /// Encodes the capabilities into a byte vector using TLV encoding.
-    #[cfg(feature = "device")]
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-
-        // Tag 0x01: ping_timeout as u32 millis (0 = None).
-        let millis: u32 = self.ping_timeout.map_or(0, |d| d.as_millis().try_into().unwrap_or(u32::MAX));
-        buf.push(Self::TAG_PING_TIMEOUT);
-        buf.extend_from_slice(&4u16.to_le_bytes());
-        buf.extend_from_slice(&millis.to_le_bytes());
-
-        // Tag 0x02: status_supported as u8 (0 = false, 1 = true).
-        buf.push(Self::TAG_STATUS_SUPPORTED);
-        buf.extend_from_slice(&1u16.to_le_bytes());
-        buf.push(u8::from(self.status_supported));
-
-        buf
+    /// Appends a TLV entry to the buffer.
+    pub fn encode(buf: &mut Vec<u8>, tag: u8, value: &[u8]) {
+        buf.push(tag);
+        buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        buf.extend_from_slice(value);
     }
 
-    /// Decodes capabilities from a TLV-encoded byte slice.
+    /// Decodes TLV entries from a byte slice.
     ///
-    /// Unknown tags are skipped. Missing tags keep their default values.
-    #[cfg(any(feature = "host", feature = "web"))]
-    pub fn decode(data: &[u8]) -> std::io::Result<Self> {
-        use std::io::{Error, ErrorKind};
-
-        let mut caps = Self::default();
+    /// Returns a list of `(tag, value)` pairs. Unknown tags are preserved
+    /// so callers can skip them for forward compatibility.
+    pub fn decode(data: &[u8]) -> std::io::Result<Vec<(u8, &[u8])>> {
+        let mut entries = Vec::new();
         let mut pos = 0;
         while pos < data.len() {
             if pos + 3 > data.len() {
@@ -145,9 +122,71 @@ impl Capabilities {
             if pos + len > data.len() {
                 return Err(Error::new(ErrorKind::InvalidData, "capabilities data truncated"));
             }
-            let value = &data[pos..pos + len];
+            entries.push((tag, &data[pos..pos + len]));
             pos += len;
+        }
+        Ok(entries)
+    }
+}
 
+/// Device capabilities.
+///
+/// Encoded using a TLV (tag-length-value) format for forward and backward
+/// compatibility: unknown tags are silently skipped during decoding and
+/// missing tags fall back to their default values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceCapabilities {
+    /// Ping timeout duration.
+    pub ping_timeout: Option<Duration>,
+    /// Whether the device supports the STATUS control request.
+    pub status_supported: bool,
+    /// Maximum receive packet size.
+    pub max_packet_size: u64,
+}
+
+impl Default for DeviceCapabilities {
+    fn default() -> Self {
+        Self { ping_timeout: None, status_supported: false, max_packet_size: MAX_SIZE as u64 }
+    }
+}
+
+impl DeviceCapabilities {
+    /// Maximum encoded capabilities size.
+    #[cfg(any(feature = "host", feature = "web"))]
+    const SIZE: usize = 256;
+
+    /// TLV tag for ping timeout.
+    const TAG_PING_TIMEOUT: u8 = 0x01;
+    /// TLV tag for status supported.
+    const TAG_STATUS_SUPPORTED: u8 = 0x02;
+    /// TLV tag for max packet size.
+    const TAG_MAX_PACKET_SIZE: u8 = 0x03;
+
+    /// Encodes the capabilities into a byte vector using TLV encoding.
+    #[cfg(feature = "device")]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Tag 0x01: ping_timeout as u32 millis (0 = None).
+        let millis: u32 = self.ping_timeout.map_or(0, |d| d.as_millis().try_into().unwrap_or(u32::MAX));
+        tlv::encode(&mut buf, Self::TAG_PING_TIMEOUT, &millis.to_le_bytes());
+
+        // Tag 0x02: status_supported as u8 (0 = false, 1 = true).
+        tlv::encode(&mut buf, Self::TAG_STATUS_SUPPORTED, &[u8::from(self.status_supported)]);
+
+        // Tag 0x03: max_packet_size as u64.
+        tlv::encode(&mut buf, Self::TAG_MAX_PACKET_SIZE, &self.max_packet_size.to_le_bytes());
+
+        buf
+    }
+
+    /// Decodes capabilities from a TLV-encoded byte slice.
+    ///
+    /// Unknown tags are skipped. Missing tags keep their default values.
+    #[cfg(any(feature = "host", feature = "web"))]
+    pub fn decode(data: &[u8]) -> std::io::Result<Self> {
+        let mut caps = Self::default();
+        for (tag, value) in tlv::decode(data)? {
             match tag {
                 Self::TAG_PING_TIMEOUT => {
                     if value.len() >= 4 {
@@ -163,6 +202,72 @@ impl Capabilities {
                     }
                 }
 
+                Self::TAG_MAX_PACKET_SIZE => {
+                    if value.len() >= 8 {
+                        let size = u64::from_le_bytes([
+                            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                        ]);
+                        caps.max_packet_size = size;
+                    }
+                }
+
+                _ => { /* unknown tag — skip for forward compatibility */ }
+            }
+        }
+        Ok(caps)
+    }
+}
+
+/// Host capabilities.
+///
+/// Encoded using a TLV (tag-length-value) format for forward and backward
+/// compatibility: unknown tags are silently skipped during decoding and
+/// missing tags fall back to their default values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostCapabilities {
+    /// Maximum receive packet size.
+    pub max_packet_size: u64,
+}
+
+impl Default for HostCapabilities {
+    fn default() -> Self {
+        Self { max_packet_size: MAX_SIZE as u64 }
+    }
+}
+
+impl HostCapabilities {
+    /// Maximum encoded capabilities size.
+    #[allow(dead_code)]
+    #[cfg(feature = "device")]
+    const SIZE: usize = 256;
+
+    /// TLV tag for max packet size.
+    const TAG_MAX_PACKET_SIZE: u8 = 0x03;
+
+    /// Encodes the capabilities into a byte vector using TLV encoding.
+    #[cfg(any(feature = "host", feature = "web"))]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        tlv::encode(&mut buf, Self::TAG_MAX_PACKET_SIZE, &self.max_packet_size.to_le_bytes());
+        buf
+    }
+
+    /// Decodes capabilities from a TLV-encoded byte slice.
+    ///
+    /// Unknown tags are skipped. Missing tags keep their default values.
+    #[cfg(feature = "device")]
+    pub fn decode(data: &[u8]) -> std::io::Result<Self> {
+        let mut caps = Self::default();
+        for (tag, value) in tlv::decode(data)? {
+            match tag {
+                Self::TAG_MAX_PACKET_SIZE => {
+                    if value.len() >= 8 {
+                        let size = u64::from_le_bytes([
+                            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                        ]);
+                        caps.max_packet_size = size;
+                    }
+                }
                 _ => { /* unknown tag — skip for forward compatibility */ }
             }
         }

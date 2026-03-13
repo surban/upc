@@ -31,17 +31,18 @@ use usb_gadget::function::{
 };
 use uuid::Uuid;
 
-use crate::{ctrl_req, status, Capabilities, Class, INFO_SIZE, MAX_SIZE};
+use crate::{channel_error, ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE, MAX_SIZE};
 
 #[derive(Debug, Clone)]
 struct Cfg {
     info: Vec<u8>,
     ping_timeout: Option<Duration>,
+    max_packet_size: u64,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
-        Self { info: Vec::new(), ping_timeout: Some(Duration::from_secs(10)) }
+        Self { info: Vec::new(), ping_timeout: Some(Duration::from_secs(10)), max_packet_size: MAX_SIZE as u64 }
     }
 }
 
@@ -49,6 +50,7 @@ impl Default for Cfg {
 pub struct UpcSender {
     tx: mpsc::Sender<Bytes>,
     error: watch::Receiver<Option<ErrorKind>>,
+    max_size: usize,
 }
 
 impl fmt::Debug for UpcSender {
@@ -60,15 +62,27 @@ impl fmt::Debug for UpcSender {
 impl UpcSender {
     /// Send packet.
     ///
+    /// If the host has closed its receive direction (half-close),
+    /// this returns an error with [`ErrorKind::BrokenPipe`].
+    ///
     /// ## Cancel safety
     /// If canceled, no data will have been sent.
     pub async fn send(&self, data: Bytes) -> Result<()> {
+        if data.len() > self.max_size {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("packet size {} exceeds maximum of {}", data.len(), self.max_size),
+            ));
+        }
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
-            Err(_) => {
-                Err(Error::new((*self.error.borrow()).unwrap_or(ErrorKind::ConnectionReset), "connection closed"))
-            }
+            Err(_) => Err(channel_error((*self.error.borrow()).unwrap_or(ErrorKind::BrokenPipe))),
         }
+    }
+
+    /// The maximum packet size accepted by the host.
+    pub fn max_size(&self) -> usize {
+        self.max_size
     }
 
     /// Wait until connection is closed.
@@ -148,7 +162,7 @@ impl UpcReceiver {
             let Some(packet) = self.rx.recv().await else {
                 // Channel closed — check if there was an error or a clean half-close.
                 return match *self.error.borrow() {
-                    Some(kind) => Err(Error::new(kind, "connection closed")),
+                    Some(kind) => Err(channel_error(kind)),
                     None => Ok(None),
                 };
             };
@@ -172,11 +186,6 @@ impl UpcReceiver {
     /// The maximum receive packet size.
     pub fn max_size(&self) -> usize {
         self.max_size
-    }
-
-    /// Sets the maximum receive packet size.
-    pub fn set_max_size(&mut self, max_size: usize) {
-        self.max_size = max_size;
     }
 
     /// Turns this into a stream of packets.
@@ -216,17 +225,19 @@ struct Head {
     error: watch::Sender<Option<ErrorKind>>,
 }
 
-fn connection(topic: Vec<u8>, max_packet_size: usize) -> (UpcSender, UpcReceiver, Head) {
+fn connection(
+    topic: Vec<u8>, max_recv_size: usize, max_send_size: usize, max_recv_packet_size: usize,
+) -> (UpcSender, UpcReceiver, Head) {
     let (tx_in, rx_in) = mpsc::channel(32);
     let (tx_out, rx_out) = mpsc::channel(32);
     let (error_tx, error_rx) = watch::channel(None);
-    let sender = UpcSender { tx: tx_out, error: error_rx.clone() };
+    let sender = UpcSender { tx: tx_out, error: error_rx.clone(), max_size: max_send_size };
     let recv = UpcReceiver {
         topic,
         rx: rx_in,
         buffer: BytesMut::new(),
-        max_size: MAX_SIZE,
-        max_packet_size,
+        max_size: max_recv_packet_size,
+        max_packet_size: max_recv_size,
         error: error_rx,
     };
     let head = Head { tx: tx_in, rx: rx_out, error: error_tx };
@@ -361,6 +372,18 @@ impl UpcFunction {
         self.cfg.lock().await.ping_timeout = timeout;
     }
 
+    /// Returns the maximum receive packet size.
+    pub async fn max_size(&self) -> u64 {
+        self.cfg.lock().await.max_packet_size
+    }
+
+    /// Sets the maximum revice packet size accepted.
+    ///
+    /// The default is [`MAX_SIZE`].
+    pub async fn set_max_size(&self, max_size: u64) {
+        self.cfg.lock().await.max_packet_size = max_size;
+    }
+
     /// Waits for and accepts an incoming connection.
     ///
     /// ## Cancel safety
@@ -482,6 +505,7 @@ impl UpcFunction {
         let mut recv_open = false;
         let mut last_status = Instant::now();
         let mut conn_error = watch::channel(None).0;
+        let mut host_caps = HostCapabilities::default();
 
         loop {
             let timeout_task = async {
@@ -511,6 +535,7 @@ impl UpcFunction {
                             tracing::debug!("device enabled");
                             max_packet_size = Some(ep_tx.lock().await.max_packet_size()?);
                             tracing::debug!("maximum packet size is {} bytes", max_packet_size.unwrap());
+                            host_caps = HostCapabilities::default();
                         }
 
                         Event::Disable => {
@@ -537,6 +562,7 @@ impl UpcFunction {
                                         out_task = future::pending().boxed();
                                         ep_tx.lock().await.cancel()?;
                                         ep_rx.lock().await.cancel()?;
+                                        host_caps = HostCapabilities::default();
                                     }
 
                                     // Clear any halt status left from a previous connection's half-close.
@@ -549,7 +575,9 @@ impl UpcFunction {
 
                                     match req.recv_all() {
                                         Ok(topic) => {
-                                            let (ctx, crx, Head { tx, rx, error }) = connection(topic, max_packet_size.unwrap());
+                                            let max_send_size = usize::try_from(host_caps.max_packet_size).unwrap_or(usize::MAX);
+                                            let max_recv_packet_size = usize::try_from(cfg.lock().await.max_packet_size).unwrap_or(usize::MAX);
+                                            let (ctx, crx, Head { tx, rx, error }) = connection(topic, max_packet_size.unwrap(), max_send_size, max_recv_packet_size);
                                             let _ = conn_tx.send((ctx, crx)).await;
                                             let (close_tx, close_rx) = watch::channel(None);
                                             in_task = Self::in_task(&ep_rx, tx, close_rx).boxed();
@@ -579,6 +607,7 @@ impl UpcFunction {
                                     }
                                     send_open = false;
                                     recv_open = false;
+                                    host_caps = HostCapabilities::default();
                                 }
 
                                 ctrl_req::CLOSE_SEND => {
@@ -608,6 +637,19 @@ impl UpcFunction {
                                     }
                                 }
 
+                                ctrl_req::CAPABILITIES => {
+                                    match req.recv_all() {
+                                        Ok(data) => match HostCapabilities::decode(&data) {
+                                            Ok(caps) => {
+                                                tracing::debug!("host capabilities: {caps:?}");
+                                                host_caps = caps;
+                                            }
+                                            Err(err) => tracing::warn!("host capabilities decode error: {err}"),
+                                        },
+                                        Err(err) => tracing::warn!("host capabilities receive error: {err}"),
+                                    }
+                                }
+
                                 other => tracing::warn!("unknown control request {other:x}"),
                             }
                         }
@@ -626,9 +668,10 @@ impl UpcFunction {
                                 ctrl_req::CAPABILITIES => {
                                     tracing::debug!("sending capabilities");
                                     let cfg = cfg.lock().await;
-                                    let caps = Capabilities {
+                                    let caps = DeviceCapabilities {
                                         ping_timeout: cfg.ping_timeout,
                                         status_supported: true,
+                                        max_packet_size: cfg.max_packet_size,
                                     };
                                     if let Err(err) = req.send(&caps.encode()) {
                                         tracing::warn!("capabilities send error: {err}");

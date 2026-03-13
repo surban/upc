@@ -14,7 +14,7 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use webusb_web::{OpenUsbDevice, UsbControlRequest, UsbDevice, UsbDirection, UsbRecipient, UsbRequestType};
 
 use super::{guard::InUseGuard, DeviceStatus, UpcOptions, UpcReceiver, UpcSender};
-use crate::{ctrl_req, status, Capabilities, Class, INFO_SIZE, MAX_SIZE};
+use crate::{ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE};
 
 pub(crate) fn to_io_err(error: webusb_web::Error) -> Error {
     let kind = match error.kind() {
@@ -277,14 +277,26 @@ pub async fn connect_with(
         0,
         interface.into(),
     );
-    let caps = match hnd.control_transfer_in(&req, Capabilities::SIZE as _).await {
-        Ok(data) => Capabilities::decode(&data)?,
+    let caps = match hnd.control_transfer_in(&req, DeviceCapabilities::SIZE as _).await {
+        Ok(data) => DeviceCapabilities::decode(&data)?,
         Err(err) => {
             tracing::debug!("capabilities query failed: {err}");
-            Capabilities::default()
+            DeviceCapabilities::default()
         }
     };
     tracing::debug!("device capabilities: {caps:?}");
+
+    // Send host capabilities.
+    tracing::debug!("sending host capabilities");
+    let host_caps = HostCapabilities { max_packet_size: options.max_size as u64 };
+    let host_caps_req = UsbControlRequest::new(
+        UsbRequestType::Vendor,
+        UsbRecipient::Interface,
+        ctrl_req::CAPABILITIES,
+        0,
+        interface.into(),
+    );
+    let _ = hnd.control_transfer_out(&host_caps_req, &host_caps.encode()).await;
 
     // Determine status polling interval.
     let status_interval = if caps.status_supported {
@@ -367,9 +379,11 @@ pub async fn connect_with(
     tracing::debug!("connection is open");
 
     // Build objects.
+    let device_max_size = usize::try_from(caps.max_packet_size).unwrap_or(usize::MAX);
     let shared = Arc::new(UpcShared { name, error, stop_tx: Some(stop_tx) });
-    let sender = UpcSender { tx: tx_out, shared: shared.clone() };
-    let recv = UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: MAX_SIZE, max_transfer_size };
+    let sender = UpcSender { tx: tx_out, shared: shared.clone(), max_size: device_max_size };
+    let recv =
+        UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: options.max_size, max_transfer_size };
 
     Ok((sender, recv))
 }
