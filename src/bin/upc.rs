@@ -9,14 +9,18 @@
 compile_error!("The `cli` feature requires at least one of `host` or `device` features to be enabled.");
 
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     pin::pin,
     process::ExitCode,
+    time::Duration,
 };
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    time::sleep,
+};
 use upc::Class;
 
 /// Default UPC interface protocol (hex string).
@@ -30,6 +34,7 @@ const DEFAULT_GUID: &str = "19840902-89fc-40d8-bc10-f71079b789b5";
 trait UpcSend {
     fn upc_send(&self, data: Bytes) -> impl std::future::Future<Output = io::Result<()>> + Send;
     fn upc_closed(&self) -> impl std::future::Future<Output = ()> + Send;
+    fn upc_max_size(&self) -> usize;
 }
 
 /// Trait abstracting over host and device UPC receivers.
@@ -44,6 +49,9 @@ impl UpcSend for upc::host::UpcSender {
     }
     async fn upc_closed(&self) {
         self.closed().await
+    }
+    fn upc_max_size(&self) -> usize {
+        self.max_size()
     }
 }
 
@@ -61,6 +69,9 @@ impl UpcSend for upc::device::UpcSender {
     }
     async fn upc_closed(&self) {
         self.closed().await
+    }
+    fn upc_max_size(&self) -> usize {
+        self.max_size()
     }
 }
 
@@ -105,72 +116,103 @@ fn close_stdout() {
     }
 }
 
+/// Check whether an I/O error is a broken pipe (remote closed receiver).
+fn is_broken_pipe(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::BrokenPipe
+}
+
 /// Forward data between stdin/stdout and a UPC channel.
-async fn forward_stdio(
-    tx: impl UpcSend + Send + 'static, mut rx: impl UpcRecv + Send + 'static, max_packet: usize, framing: Framing,
-) {
+async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing) -> io::Result<()> {
     let mut stdin = tokio::io::stdin();
     let stdout = io::stdout();
 
-    let send_task = tokio::spawn(async move {
-        let closed = pin!(tx.upc_closed());
-        match framing {
+    let framing = match framing {
+        Framing::Auto => {
+            if std::io::stdin().is_terminal() {
+                Framing::Line
+            } else {
+                Framing::Raw
+            }
+        }
+        other => other,
+    };
+
+    let send_fut = async move {
+        let max_send = tx.upc_max_size();
+        let mut closed = pin!(tx.upc_closed());
+        let res: io::Result<()> = match framing {
             Framing::Line => {
                 let mut lines = BufReader::new(stdin).lines();
-                let mut closed = closed;
                 loop {
                     tokio::select! {
                         biased;
-                        () = &mut closed => break,
+                        () = &mut closed => break Ok(()),
                         line = lines.next_line() => match line {
                             Ok(Some(line)) => {
-                                if tx.upc_send(Bytes::from(line)).await.is_err() {
-                                    break;
+                                let mut data = line.into_bytes();
+                                data.push(b'\n');
+                                for chunk in data.chunks(max_send) {
+                                    match tx.upc_send(Bytes::copy_from_slice(chunk)).await {
+                                        Ok(()) => {}
+                                        Err(err) if is_broken_pipe(&err) => return Ok(()),
+                                        Err(err) => return Err(err),
+                                    }
                                 }
                             }
-                            _ => break,
+                            Ok(None) => break Ok(()),
+                            Err(err) => break Err(err),
                         },
                     }
                 }
             }
             Framing::Raw => {
-                let mut buf = vec![0u8; max_packet];
-                let mut closed = closed;
+                let mut buf = vec![0u8; max_send];
                 loop {
                     tokio::select! {
                         biased;
-                        () = &mut closed => break,
+                        () = &mut closed => break Ok(()),
                         result = stdin.read(&mut buf) => match result {
-                            Ok(0) | Err(_) => break,
+                            Ok(0) => break Ok(()),
+                            Err(err) => break Err(err),
                             Ok(n) => {
-                                if tx.upc_send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                                    break;
+                                match tx.upc_send(Bytes::copy_from_slice(&buf[..n])).await {
+                                    Ok(()) => {}
+                                    Err(err) if is_broken_pipe(&err) => return Ok(()),
+                                    Err(err) => return Err(err),
                                 }
                             }
                         },
                     }
                 }
             }
-        }
+            Framing::Auto => unreachable!(),
+        };
         close_stdin();
-    });
+        res
+    };
 
-    let recv_task = tokio::spawn(async move {
-        loop {
+    let recv_fut = async move {
+        let res: io::Result<()> = loop {
             match rx.upc_recv().await {
                 Ok(Some(data)) => {
                     let mut stdout = stdout.lock();
-                    if stdout.write_all(&data).and_then(|_| stdout.flush()).is_err() {
-                        break;
+                    if let Err(err) = stdout.write_all(&data).and_then(|_| stdout.flush()) {
+                        break Err(err);
                     }
                 }
-                Ok(None) | Err(_) => break,
+                Ok(None) => break Ok(()),
+                Err(err) if is_broken_pipe(&err) => break Ok(()),
+                Err(err) => break Err(err),
             }
-        }
+        };
         close_stdout();
-    });
+        res
+    };
 
-    let _ = tokio::join!(send_task, recv_task);
+    tokio::try_join!(send_fut, recv_fut)?;
+
+    sleep(Duration::from_millis(100)).await;
+    Ok(())
 }
 
 // ---- Argument parsing helpers ----
@@ -188,6 +230,8 @@ fn parse_hex_u8(s: &str) -> Result<u8, String> {
 /// How stdin is split into packets.
 #[derive(Clone, Copy, ValueEnum)]
 enum Framing {
+    /// Automatic: line-wise when stdin is a terminal, raw otherwise.
+    Auto,
     /// Each line (delimited by newline) becomes one packet.
     Line,
     /// Each read() call becomes one packet.
@@ -461,14 +505,14 @@ struct ConnectCmd {
     max_packet: usize,
 
     /// Stdin framing mode.
-    #[arg(long, value_enum, default_value_t = Framing::Line)]
+    #[arg(long, value_enum, default_value_t = Framing::Auto)]
     framing: Framing,
 }
 
 #[cfg(feature = "host")]
 impl ConnectCmd {
     async fn exec(self) -> ExitCode {
-        use upc::host::connect;
+        use upc::host::{connect_with, UpcOptions};
 
         let devices: Vec<_> = match nusb::list_devices().await {
             Ok(iter) => iter.collect(),
@@ -512,7 +556,9 @@ impl ConnectCmd {
             }
         };
 
-        let (tx, mut rx) = match connect(dev, iface_num, self.topic.as_bytes()).await {
+        let options = UpcOptions::new().with_topic(self.topic.into_bytes()).with_max_size(self.max_packet);
+
+        let (tx, rx) = match connect_with(dev, iface_num, options).await {
             Ok(pair) => pair,
             Err(err) => {
                 eprintln!("Cannot connect: {err}");
@@ -520,11 +566,10 @@ impl ConnectCmd {
             }
         };
 
-        if self.max_packet > 0 {
-            rx.set_max_size(self.max_packet);
+        if let Err(err) = forward_stdio(tx, rx, self.framing).await {
+            eprintln!("Error: {err:#}");
+            return ExitCode::FAILURE;
         }
-
-        forward_stdio(tx, rx, self.max_packet, self.framing).await;
 
         ExitCode::SUCCESS
     }
@@ -575,12 +620,12 @@ struct DeviceCmd {
     #[arg(long, default_value = "")]
     info: String,
 
-    /// Maximum packet size in bytes.
-    #[arg(long, default_value_t = 65536)]
-    max_packet: usize,
+    /// Maximum receive packet size in bytes.
+    #[arg(long)]
+    max_packet: Option<u64>,
 
     /// Stdin framing mode.
-    #[arg(long, value_enum, default_value_t = Framing::Line)]
+    #[arg(long, value_enum, default_value_t = Framing::Auto)]
     framing: Framing,
 }
 
@@ -612,6 +657,10 @@ impl DeviceCmd {
             upc.set_info(self.info.as_bytes().to_vec()).await;
         }
 
+        if let Some(size) = self.max_packet {
+            upc.set_max_size(size).await;
+        }
+
         let udc = match default_udc() {
             Ok(udc) => udc,
             Err(err) => {
@@ -636,7 +685,7 @@ impl DeviceCmd {
             }
         };
 
-        let (tx, mut rx) = match upc.accept().await {
+        let (tx, rx) = match upc.accept().await {
             Ok(conn) => conn,
             Err(err) => {
                 eprintln!("Accept failed: {err}");
@@ -644,11 +693,10 @@ impl DeviceCmd {
             }
         };
 
-        if self.max_packet > 0 {
-            rx.set_max_size(self.max_packet);
+        if let Err(err) = forward_stdio(tx, rx, self.framing).await {
+            eprintln!("Error: {err:#}");
+            return ExitCode::FAILURE;
         }
-
-        forward_stdio(tx, rx, self.max_packet, self.framing).await;
 
         ExitCode::SUCCESS
     }

@@ -48,7 +48,7 @@ jobs:
         run: .misc/build-kernel.sh --kernel-version "$KERNEL_VERSION"
 
       - name: Build (release)
-        run: cargo build --release --all-targets --features host,device
+        run: cargo build --release --all-targets --features cli,host,device
 
       - name: Run tests
         run: |
@@ -56,3 +56,7 @@ jobs:
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=".misc/cargo-test-runner.sh"
           cargo test --release --features host,device -- --nocapture 
         timeout-minutes: 15
+
+      - name: Run CLI pipe tests
+        run: .misc/cargo-test-runner.sh .misc/test-cli-pipe.sh ./target/release/upc
+        timeout-minutes: 5
