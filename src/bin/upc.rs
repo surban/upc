@@ -387,7 +387,7 @@ impl ProbeCmd {
 
             let mut upc_ifaces = Vec::new();
             for iface in dev_info.interfaces() {
-                if !self.filter.matches_interface(&iface) {
+                if !self.filter.matches_interface(iface) {
                     continue;
                 }
                 if iface.class() == Class::VENDOR_SPECIFIC || self.filter.interface.is_some() {
@@ -412,7 +412,7 @@ impl ProbeCmd {
                 );
 
                 for iface in dev_info.interfaces() {
-                    if !self.filter.matches_interface(&iface) {
+                    if !self.filter.matches_interface(iface) {
                         continue;
                     }
                     let iface_num = iface.interface_number();
@@ -529,7 +529,7 @@ impl ConnectCmd {
             }
 
             for iface in dev_info.interfaces() {
-                if !self.filter.matches_interface(&iface) {
+                if !self.filter.matches_interface(iface) {
                     continue;
                 }
 
@@ -568,7 +568,7 @@ impl ConnectCmd {
 
         if let Err(err) = forward_stdio(tx, rx, self.framing).await {
             eprintln!("Error: {err:#}");
-            return ExitCode::FAILURE;
+            std::process::exit(1);
         }
 
         ExitCode::SUCCESS
@@ -695,7 +695,7 @@ impl DeviceCmd {
 
         if let Err(err) = forward_stdio(tx, rx, self.framing).await {
             eprintln!("Error: {err:#}");
-            return ExitCode::FAILURE;
+            std::process::exit(1);
         }
 
         ExitCode::SUCCESS
