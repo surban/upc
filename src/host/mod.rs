@@ -85,6 +85,16 @@ impl UpcOptions {
         self.ping_interval = ping_interval;
         self
     }
+
+    /// Returns the topic data.
+    pub fn topic(&self) -> &[u8] {
+        &self.topic
+    }
+
+    /// Returns the requested ping interval.
+    pub fn ping_interval(&self) -> Option<Duration> {
+        self.ping_interval
+    }
 }
 
 impl Default for UpcOptions {
