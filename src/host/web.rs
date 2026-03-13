@@ -408,7 +408,7 @@ async fn in_task(
             Ok(buf) => {
                 #[cfg(feature = "trace-packets")]
                 tracing::trace!("Received packet of {} bytes", buf.len());
-                if tx.send(Bytes::from(buf).into()).await.is_err() {
+                if tx.send(Bytes::from(buf)).await.is_err() {
                     break true;
                 }
             }
