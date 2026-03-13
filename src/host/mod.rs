@@ -50,14 +50,30 @@ pub(crate) struct DeviceStatus {
 }
 
 /// Options for connecting to a USB packet channel.
+///
+/// Use [`UpcOptions::new`] to create a default set of options,
+/// then chain `with_*` methods to customize.
 #[derive(Debug, Clone)]
 pub struct UpcOptions {
-    /// Topic data provided to the device. Contains user-defined data.
+    pub(crate) topic: Vec<u8>,
+    pub(crate) ping_interval: Option<Duration>,
+}
+
+impl UpcOptions {
+    /// Creates a new set of default connection options.
+    pub fn new() -> Self {
+        Self { topic: Vec::new(), ping_interval: Some(Duration::from_secs(5)) }
+    }
+
+    /// Sets the topic data provided to the device.
     ///
     /// The maximum size is [`crate::INFO_SIZE`].
-    pub topic: Vec<u8>,
+    pub fn with_topic(mut self, topic: Vec<u8>) -> Self {
+        self.topic = topic;
+        self
+    }
 
-    /// Requested interval for pinging the device.
+    /// Sets the requested interval for pinging the device.
     ///
     /// The actual ping interval is the minimum of this value and half
     /// the device's ping timeout (set via [`crate::device::UpcFunction::set_ping_timeout`]).
@@ -65,12 +81,15 @@ pub struct UpcOptions {
     /// regardless of this setting.
     ///
     /// The default is 5 seconds.
-    pub ping_interval: Option<Duration>,
+    pub fn with_ping_interval(mut self, ping_interval: Option<Duration>) -> Self {
+        self.ping_interval = ping_interval;
+        self
+    }
 }
 
 impl Default for UpcOptions {
     fn default() -> Self {
-        Self { topic: Vec::new(), ping_interval: Some(Duration::from_secs(5)) }
+        Self::new()
     }
 }
 

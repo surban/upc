@@ -225,7 +225,7 @@ impl HalfCloseHandle {
 /// # Panics
 /// Panics if the size of `topic` is larger than [`INFO_SIZE`].
 pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSender, UpcReceiver)> {
-    connect_with(dev, interface, UpcOptions { topic: topic.into(), ..Default::default() }).await
+    connect_with(dev, interface, UpcOptions::new().with_topic(topic.into())).await
 }
 
 /// Connect to the specified device and interface with options.

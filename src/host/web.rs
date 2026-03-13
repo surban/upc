@@ -183,7 +183,7 @@ impl Drop for UpcShared {
 /// # Panics
 /// Panics if the size of `topic` is larger than [`INFO_SIZE`].
 pub async fn connect(hnd: Rc<OpenUsbDevice>, interface: u8, topic: &[u8]) -> Result<(UpcSender, UpcReceiver)> {
-    connect_with(hnd, interface, UpcOptions { topic: topic.into(), ..Default::default() }).await
+    connect_with(hnd, interface, UpcOptions::new().with_topic(topic.into())).await
 }
 
 /// Connect to the specified device and interface with options.
