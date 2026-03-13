@@ -377,29 +377,54 @@ impl UpcFunction {
         }
     }
 
-    async fn in_task(ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<BytesMut>) -> Result<()> {
+    /// Returns `true` if the host initiated the close (CLOSE_SEND with byte count reached),
+    /// `false` if the device-side receiver was dropped.
+    async fn in_task(
+        ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<BytesMut>, mut close_rx: watch::Receiver<Option<u64>>,
+    ) -> Result<bool> {
         let mut ep_rx = ep_rx.lock().await;
         let max_packet_size = ep_rx.max_packet_size()?;
         let tx2 = tx.clone();
+        let mut total_received: u64 = 0;
 
-        while let Ok(permit) = tx.reserve().await {
-            // Select between receiving USB data and detecting that the
+        loop {
+            // Check if we have already received all bytes the host sent.
+            if let Some(expected) = *close_rx.borrow() {
+                if total_received == expected {
+                    tracing::debug!(
+                        "received all {total_received} bytes from host (expected {expected}), closing"
+                    );
+                    return Ok(true);
+                }
+            }
+
+            let Ok(permit) = tx.reserve().await else { break };
+
+            // Select between receiving USB data, detecting that the
             // UpcReceiver has been dropped (so we can send the CLOSE_RECV
-            // notification promptly even when the host is idle).
+            // notification promptly even when the host is idle), and
+            // the host signaling CLOSE_SEND with a byte count.
             tokio::select! {
                 biased;
                 res = ep_rx.recv_async(BytesMut::with_capacity(max_packet_size)) => {
                     if let Some(data) = res? {
+                        total_received = total_received.wrapping_add(data.len() as u64);
                         #[cfg(feature = "trace-packets")]
-                        tracing::trace!("Received packet of {} bytes", data.len());
+                        tracing::trace!("Received packet of {} bytes (total: {total_received})", data.len());
                         permit.send(data);
                     }
                 }
                 () = tx2.closed() => break,
+                res = close_rx.changed() => {
+                    // CLOSE_SEND received with byte count — loop back to check the count.
+                    if res.is_err() {
+                        break;
+                    }
+                }
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     async fn out_task(ep_tx: &Mutex<EndpointSender>, mut rx: mpsc::Receiver<Bytes>) -> Result<()> {
@@ -451,6 +476,7 @@ impl UpcFunction {
 
         let mut in_task = future::pending().boxed();
         let mut out_task = future::pending().boxed();
+        let mut in_close_tx = watch::channel(None::<u64>).0;
 
         let mut send_open = false;
         let mut recv_open = false;
@@ -525,8 +551,10 @@ impl UpcFunction {
                                         Ok(topic) => {
                                             let (ctx, crx, Head { tx, rx, error }) = connection(topic, max_packet_size.unwrap());
                                             let _ = conn_tx.send((ctx, crx)).await;
-                                            in_task = Self::in_task(&ep_rx, tx).boxed();
+                                            let (close_tx, close_rx) = watch::channel(None);
+                                            in_task = Self::in_task(&ep_rx, tx, close_rx).boxed();
                                             out_task = Self::out_task(&ep_tx, rx).boxed();
+                                            in_close_tx = close_tx;
                                             send_open = true;
                                             recv_open = true;
                                             last_status = Instant::now();
@@ -555,15 +583,14 @@ impl UpcFunction {
 
                                 ctrl_req::CLOSE_SEND => {
                                     tracing::debug!("host closed send direction");
-                                    if let Err(err) = req.recv_all() {
-                                        tracing::warn!("close-send request receive error: {err}");
-                                    }
-                                    if recv_open {
-                                        // Stop receiving from the host (the in_task reads from OUT endpoint).
-                                        in_task = future::pending().boxed();
-                                        ep_rx.lock().await.cancel()?;
-                                        recv_open = false;
-                                        tracing::debug!("receive direction closed");
+                                    match req.recv_all() {
+                                        Ok(data) if data.len() >= 8 => {
+                                            let total_bytes = u64::from_le_bytes(data[..8].try_into().unwrap());
+                                            tracing::debug!("CLOSE_SEND with total_bytes={total_bytes}");
+                                            let _ = in_close_tx.send(Some(total_bytes));
+                                        }
+                                        Ok(_) => tracing::warn!("CLOSE_SEND without byte count"),
+                                        Err(err) => tracing::warn!("close-send request receive error: {err}"),
                                     }
                                 }
 
@@ -643,18 +670,25 @@ impl UpcFunction {
                 }
 
                 res = &mut in_task => {
-                    // in_task ended: device-side UpcReceiver was dropped.
-                    // Halt the OUT endpoint; the host will learn about this
-                    // via the next STATUS poll or via a STALL on the OUT endpoint.
-                    match res {
-                        Ok(()) => tracing::debug!("device receiver dropped"),
-                        Err(err) => tracing::warn!("device receiver failed: {err}")
-                    }
-                    recv_open = false;
+                    in_close_tx = watch::channel(None).0;
                     in_task = future::pending().boxed();
                     ep_rx.lock().await.cancel()?;
-                    let _ = ep_rx.lock().await.control()?.halt();
-                    tracing::debug!("OUT endpoint halted (device done receiving)");
+                    recv_open = false;
+                    match res {
+                        Ok(true) => {
+                            // Host-initiated: CLOSE_SEND byte count reached.
+                            // All expected data has been received.
+                            tracing::debug!("all host bytes received after CLOSE_SEND");
+                        }
+                        Ok(false) => {
+                            // Device-initiated: UpcReceiver was dropped.
+                            // Halt the OUT endpoint so the host learns about it.
+                            tracing::debug!("device receiver dropped");
+                            let _ = ep_rx.lock().await.control()?.halt();
+                            tracing::debug!("OUT endpoint halted (device done receiving)");
+                        }
+                        Err(err) => tracing::warn!("device receiver failed: {err}"),
+                    }
                 }
 
                 res = &mut out_task => {

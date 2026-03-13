@@ -106,13 +106,17 @@ impl HalfCloseHandle {
 
     /// Mark send direction as closed.
     ///
-    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_SEND.
+    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_SEND
+    /// with the total number of bytes sent so the device can drain the endpoint.
     /// If false (device-initiated close via notification), no control request is sent.
-    async fn close_send(&mut self, notify_device: bool) {
+    async fn close_send(&mut self, notify_device: bool, total_bytes_sent: u64) {
         if !self.send_closed {
             self.send_closed = true;
             if notify_device {
-                tracing::debug!("host send closed, sending CTRL_REQ_CLOSE_SEND");
+                tracing::debug!(
+                    "host send closed, sending CTRL_REQ_CLOSE_SEND (total_bytes_sent={total_bytes_sent})"
+                );
+                let payload = total_bytes_sent.to_le_bytes();
                 let control = UsbControlRequest::new(
                     UsbRequestType::Vendor,
                     UsbRecipient::Interface,
@@ -120,7 +124,7 @@ impl HalfCloseHandle {
                     0,
                     self.iface.into(),
                 );
-                if let Err(err) = self.hnd.control_transfer_out(&control, &[]).await {
+                if let Err(err) = self.hnd.control_transfer_out(&control, &payload).await {
                     tracing::warn!("sending CTRL_REQ_CLOSE_SEND failed: {err}");
                 }
             } else {
@@ -416,6 +420,7 @@ async fn out_task(
     mut stop_rx: oneshot::Receiver<()>, max_packet_size: usize,
     half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>, mut status_rx: watch::Receiver<DeviceStatus>,
 ) {
+    let mut total_bytes_sent: u64 = 0;
     let host_initiated = 'outer: {
         loop {
             let data = tokio::select! {
@@ -427,6 +432,8 @@ async fn out_task(
                 }
             };
             let Some(mut data) = data else { break 'outer true };
+
+            total_bytes_sent = total_bytes_sent.wrapping_add(data.len() as u64);
 
             loop {
                 match stop_rx.try_recv() {
@@ -465,7 +472,7 @@ async fn out_task(
         }
     };
 
-    half_close.lock().await.close_send(host_initiated).await;
+    half_close.lock().await.close_send(host_initiated, total_bytes_sent).await;
 }
 
 async fn close(hnd: &OpenUsbDevice, iface: u8) {

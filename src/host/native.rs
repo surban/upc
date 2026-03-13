@@ -161,16 +161,20 @@ impl HalfCloseHandle {
 
     /// Mark send direction as closed.
     ///
-    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_SEND.
+    /// If `notify_device` is true (host-initiated close), sends ctrl_req::CLOSE_SEND
+    /// with the total number of bytes sent so the device can drain the endpoint.
     /// If false (device-initiated close via notification), no control request is sent.
-    async fn close_send(&mut self, notify_device: bool) {
+    async fn close_send(&mut self, notify_device: bool, total_bytes_sent: u64) {
         if !self.send_closed {
             self.send_closed = true;
             if notify_device {
-                tracing::debug!("host send closed, sending CTRL_REQ_CLOSE_SEND");
+                tracing::debug!(
+                    "host send closed, sending CTRL_REQ_CLOSE_SEND (total_bytes_sent={total_bytes_sent})"
+                );
+                let payload = total_bytes_sent.to_le_bytes();
                 if let Err(err) = self
                     .iface
-                    .control_out(control_out(ctrl_req::CLOSE_SEND, 0, self.interface.into(), &[]), TIMEOUT)
+                    .control_out(control_out(ctrl_req::CLOSE_SEND, 0, self.interface.into(), &payload), TIMEOUT)
                     .await
                 {
                     tracing::warn!("sending CTRL_REQ_CLOSE_SEND failed: {err}");
@@ -440,6 +444,7 @@ async fn out_task(
     max_packet_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
     mut status_rx: watch::Receiver<DeviceStatus>,
 ) {
+    let mut total_bytes_sent: u64 = 0;
     let host_initiated = 'task: {
         loop {
             let data = tokio::select! {
@@ -467,6 +472,8 @@ async fn out_task(
                 }
                 break 'task true;
             };
+
+            total_bytes_sent = total_bytes_sent.wrapping_add(data.len() as u64);
 
             #[cfg(feature = "trace-packets")]
             tracing::trace!("Queueing packet of {} bytes for sending", data.len());
@@ -513,7 +520,7 @@ async fn out_task(
         }
     };
 
-    half_close.lock().await.close_send(host_initiated).await;
+    half_close.lock().await.close_send(host_initiated, total_bytes_sent).await;
 }
 
 async fn status_task(
