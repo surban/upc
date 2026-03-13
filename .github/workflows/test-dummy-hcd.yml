@@ -50,10 +50,9 @@ jobs:
       - name: Build (release)
         run: cargo build --release --all-targets --features host,device
 
-      - name: Run loopback test in VM
+      - name: Run tests
         run: |
           set -euo pipefail
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=".misc/cargo-test-runner.sh"
-          cargo test --release --test loopback --features host,device \
-            -- --nocapture --test-threads=1
+          cargo test --release --features host,device -- --nocapture 
         timeout-minutes: 15

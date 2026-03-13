@@ -5,22 +5,23 @@ use futures::FutureExt;
 use nusb::{
     descriptors::TransferType,
     transfer::{
-        Buffer, Bulk, Completion, ControlIn, ControlOut, ControlType, Direction, In, Interrupt, Out, Recipient,
+        Buffer, Bulk, Completion, ControlIn, ControlOut, ControlType, Direction, In, Out, Recipient,
         TransferError,
     },
     Device, DeviceInfo, Endpoint, Interface,
 };
 use std::{
-    future::{self, Future},
     io::{Error, ErrorKind, Result},
-    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::{mpsc, watch},
+    time::{sleep, timeout},
+};
 
-use super::{UpcReceiver, UpcSender};
-use crate::{ctrl_req, notify, Class, INFO_SIZE, MAX_SIZE};
+use super::{DeviceStatus, UpcOptions, UpcReceiver, UpcSender};
+use crate::{ctrl_req, status, Capabilities, Class, INFO_SIZE, MAX_SIZE};
 
 const TIMEOUT: Duration = Duration::from_secs(1);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -224,12 +225,21 @@ impl HalfCloseHandle {
 /// # Panics
 /// Panics if the size of `topic` is larger than [`INFO_SIZE`].
 pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSender, UpcReceiver)> {
-    assert!(topic.len() <= INFO_SIZE, "topic too big");
+    connect_with(dev, interface, UpcOptions { topic: topic.into(), ..Default::default() }).await
+}
+
+/// Connect to the specified device and interface with options.
+///
+/// Use [`find_interface`] to determine the `interface` number.
+///
+/// # Panics
+/// Panics if the size of `topic` is larger than [`INFO_SIZE`].
+pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Result<(UpcSender, UpcReceiver)> {
+    assert!(options.topic.len() <= INFO_SIZE, "topic too big");
 
     // Get endpoints.
     let mut ep_in = None;
     let mut ep_out = None;
-    let mut ep_notify = None;
     let mut max_packet_size = usize::MAX;
     {
         let cfg = dev.active_configuration().map_err(|err| Error::new(ErrorKind::NetworkDown, err))?;
@@ -246,9 +256,6 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
                 (Direction::Out, TransferType::Bulk) => {
                     max_packet_size = max_packet_size.min(ep.max_packet_size());
                     ep_out = Some(ep.address());
-                }
-                (Direction::In, TransferType::Interrupt) => {
-                    ep_notify = Some(ep.address());
                 }
                 _ => {}
             }
@@ -272,7 +279,7 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
                         return Err(nusb_to_io_err(err));
                     }
                     tracing::debug!("interface {interface} is busy, retrying…");
-                    tokio::time::sleep(CLAIM_RETRY_INTERVAL).await;
+                    sleep(CLAIM_RETRY_INTERVAL).await;
                 }
                 Err(err) => return Err(nusb_to_io_err(err)),
             }
@@ -282,15 +289,6 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
     let mut ep_out = iface.endpoint::<Bulk, Out>(ep_out).map_err(nusb_to_io_err)?;
     ep_in.clear_halt().await.map_err(nusb_to_io_err)?;
     ep_out.clear_halt().await.map_err(nusb_to_io_err)?;
-
-    let mut ep_notify_ep = if let Some(ep_notify_addr) = ep_notify {
-        let mut ep = iface.endpoint::<Interrupt, In>(ep_notify_addr).map_err(nusb_to_io_err)?;
-        ep.clear_halt().await.map_err(nusb_to_io_err)?;
-        Some(ep)
-    } else {
-        tracing::debug!("no interrupt notification endpoint found, using STALL-only detection");
-        None
-    };
 
     // Close previous connection.
     tracing::debug!("closing previous connection");
@@ -314,10 +312,39 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
         }
     }
 
+    // Query capabilities.
+    tracing::debug!("querying capabilities");
+    let caps = match iface
+        .control_in(
+            control_in(ctrl_req::CAPABILITIES, 0, interface.into(), Capabilities::SIZE.try_into().unwrap()),
+            TIMEOUT,
+        )
+        .await
+    {
+        Ok(data) => Capabilities::decode(&data)?,
+        Err(err) => {
+            tracing::debug!("capabilities query failed: {err}");
+            Capabilities::default()
+        }
+    };
+    tracing::debug!("device capabilities: {caps:?}");
+
+    // Determine status polling interval.
+    let status_interval = if caps.status_supported {
+        match (options.ping_interval, caps.ping_timeout) {
+            (Some(ping_interval), Some(ping_timeout)) => Some(ping_interval.min(ping_timeout / 2)),
+            (None, Some(ping_timeout)) => Some(ping_timeout / 2),
+            (Some(ping_interval), None) => Some(ping_interval),
+            (None, None) => None,
+        }
+    } else {
+        None
+    };
+
     // Open connection.
     tracing::debug!("opening connection");
     iface
-        .control_out(control_out(ctrl_req::OPEN, 0, interface.into(), topic), TIMEOUT)
+        .control_out(control_out(ctrl_req::OPEN, 0, interface.into(), &options.topic), TIMEOUT)
         .await
         .map_err(transfer_to_io_err)?;
     tracing::debug!("connection is open");
@@ -325,20 +352,29 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
     // Start handler tasks.
     let error = Arc::new(Mutex::new(None));
     let name = format!("{dev:?}:{interface}");
-    let half_close = Arc::new(tokio::sync::Mutex::new(HalfCloseHandle::new(iface, interface)));
+    let half_close = Arc::new(tokio::sync::Mutex::new(HalfCloseHandle::new(iface.clone(), interface)));
+
+    let (status_tx, status_rx) = watch::channel(DeviceStatus::default());
+    match status_interval {
+        Some(status_interval) => {
+            let error_status = error.clone();
+            tokio::spawn(status_task(iface, interface, status_interval, status_tx, error_status));
+        }
+        None => {
+            tokio::spawn(async move { status_tx.closed().await });
+        }
+    }
 
     let error_in = error.clone();
     let (tx_in, rx_in) = mpsc::channel(BUFFER_COUNT);
     let half_close_in = half_close.clone();
-    tokio::spawn(in_task(ep_in, tx_in, error_in, max_transfer_size, half_close_in));
-
-    let device_close_recv: Pin<Box<dyn Future<Output = ()> + Send>> =
-        if let Some(ep) = ep_notify_ep.take() { Box::pin(notify_task(ep)) } else { Box::pin(future::pending()) };
+    let status_rx_in = status_rx.clone();
+    tokio::spawn(in_task(ep_in, tx_in, error_in, max_transfer_size, half_close_in, status_rx_in));
 
     let (tx_out, rx_out) = mpsc::channel(BUFFER_COUNT);
     let error_out = error.clone();
     let half_close_out = half_close.clone();
-    tokio::spawn(out_task(ep_out, rx_out, error_out, max_packet_size, half_close_out, device_close_recv));
+    tokio::spawn(out_task(ep_out, rx_out, error_out, max_packet_size, half_close_out, status_rx));
 
     // Build objects.
     let shared = Arc::new(UpcShared { name, error });
@@ -351,6 +387,7 @@ pub async fn connect(dev: Device, interface: u8, topic: &[u8]) -> Result<(UpcSen
 async fn in_task(
     mut ep: Endpoint<Bulk, In>, tx: mpsc::Sender<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
     max_transfer_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
+    mut status_rx: watch::Receiver<DeviceStatus>,
 ) {
     let host_initiated = {
         // Pre-submit buffers.
@@ -364,6 +401,10 @@ async fn in_task(
                 biased;
                 comp = ep.next_complete() => comp,
                 () = tx.closed() => break true,
+                _ = status_rx.wait_for(|s| s.dead) => {
+                    tracing::debug!("device dead (ping timeout), stopping in_task");
+                    break false;
+                }
             };
 
             if let Err(err) = comp.status {
@@ -373,7 +414,7 @@ async fn in_task(
                     tracing::debug!("device halted IN endpoint (done sending)");
                 } else {
                     tracing::warn!("receiving failed: {err}");
-                    *error.lock().unwrap() = Some(err.into());
+                    error.lock().unwrap().get_or_insert(err.into());
                 }
                 break false;
             }
@@ -397,14 +438,14 @@ async fn in_task(
 async fn out_task(
     mut ep: Endpoint<Bulk, Out>, mut rx: mpsc::Receiver<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
     max_packet_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
-    mut device_close: Pin<Box<dyn Future<Output = ()> + Send>>,
+    mut status_rx: watch::Receiver<DeviceStatus>,
 ) {
     let host_initiated = 'task: {
         loop {
             let data = tokio::select! {
                 biased;
-                () = &mut device_close => {
-                    tracing::debug!("received device close-recv notification in out_task");
+                _ = status_rx.wait_for(|s| s.recv_closed || s.dead) => {
+                    tracing::debug!("device status change in out_task, stopping");
                     break 'task false;
                 }
                 data = rx.recv() => data,
@@ -419,7 +460,7 @@ async fn out_task(
                             tracing::debug!("device halted OUT endpoint during flush");
                         } else {
                             tracing::warn!("sending failed during flush: {err}");
-                            *error.lock().unwrap() = Some(err.into());
+                            error.lock().unwrap().get_or_insert(err.into());
                         }
                         break 'task false;
                     }
@@ -455,7 +496,7 @@ async fn out_task(
                         tracing::debug!("device halted OUT endpoint (done receiving)");
                     } else {
                         tracing::warn!("sending failed: {err}");
-                        *error.lock().unwrap() = Some(err.into());
+                        error.lock().unwrap().get_or_insert(err.into());
                     }
                     break 'task false;
                 }
@@ -475,29 +516,42 @@ async fn out_task(
     half_close.lock().await.close_send(host_initiated).await;
 }
 
-async fn notify_task(mut ep: Endpoint<Interrupt, In>) {
-    // Pre-submit a buffer for interrupt IN polling.
-    ep.submit(Buffer::new(notify::MAX_PACKET_SIZE));
-
+async fn status_task(
+    iface: Interface, interface: u8, status_interval: Duration, status_tx: watch::Sender<DeviceStatus>,
+    error: Arc<Mutex<Option<TaskError>>>,
+) {
     loop {
-        ep.submit(Buffer::new(notify::MAX_PACKET_SIZE));
-        let comp = ep.next_complete().await;
-
-        if let Err(err) = comp.status {
-            tracing::warn!("notification transfer failed: {err}");
-            return;
+        tokio::select! {
+            () = sleep(status_interval) => (),
+            () = status_tx.closed() => return,
         }
 
-        let mut buf = comp.buffer.into_vec();
-        buf.truncate(comp.actual_len);
+        let res = iface
+            .control_in(
+                control_in(ctrl_req::STATUS, 0, interface.into(), status::MAX_SIZE.try_into().unwrap()),
+                TIMEOUT,
+            )
+            .await;
 
-        for &byte in &buf {
-            match byte {
-                notify::CLOSE_RECV => {
-                    tracing::debug!("received device close-recv notification");
-                    return;
+        match res {
+            Ok(data) => {
+                for &byte in &data {
+                    match byte {
+                        status::RECV_CLOSED => {
+                            if !status_tx.borrow().recv_closed {
+                                tracing::debug!("device status: recv_closed");
+                                status_tx.send_modify(|status| status.recv_closed = true);
+                            }
+                        }
+                        other => tracing::warn!("unknown status byte: {other:#x}"),
+                    }
                 }
-                other => tracing::warn!("unknown notification byte: {other:#x}"),
+            }
+            Err(err) => {
+                tracing::warn!("status request failed: {err}");
+                error.lock().unwrap().get_or_insert(err.into());
+                status_tx.send_modify(|status| status.dead = true);
+                return;
             }
         }
     }

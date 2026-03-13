@@ -8,28 +8,24 @@
 
 #![cfg(all(feature = "host", feature = "device"))]
 
-use std::time::{Duration, Instant};
+mod util;
+
 use bytes::Bytes;
 use rand::{prelude::*, rngs::SmallRng};
-use tokio::{sync::oneshot, time::sleep};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
-use uuid::uuid;
 use serial_test::serial;
+use std::time::{Duration, Instant};
+use tokio::{sync::oneshot, time::sleep};
+use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
+use util::*;
+use uuid::uuid;
 
 use upc::{
     device::{InterfaceId, UpcFunction},
     host::{connect, find_interface, info},
-    Class,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const VID: u16 = 4;
-const PID: u16 = 5;
-
-const CLASS: Class = Class::vendor_specific(22, 3);
-const DEVICE_CLASS: Class = Class::vendor_specific(0xff, 0);
 const TOPIC: &[u8] = b"LOOPBACK TEST TOPIC";
 const INFO: &[u8] = b"LOOPBACK TEST INFO";
 
@@ -76,17 +72,6 @@ impl TestData {
         assert_eq!(data.len(), expected.len(), "data length mismatch");
         assert_eq!(data, &expected[..], "data content mismatch");
     }
-}
-
-// ── Logging initializer ─────────────────────────────────────────────────────
-
-fn init_log() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
-        tracing_log::LogTracer::init().unwrap();
-    });
 }
 
 // ── The actual loopback test ─────────────────────────────────────────────────

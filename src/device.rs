@@ -15,25 +15,40 @@ use std::{
     pin::{pin, Pin},
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex},
     task::JoinSet,
+    time::Instant,
 };
 use usb_gadget::function::{
     custom::{
         Custom, CustomBuilder, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface,
-        OsExtCompat, OsExtProp, TransferType,
+        OsExtCompat, OsExtProp,
     },
     Handle,
 };
 use uuid::Uuid;
 
-use crate::{ctrl_req, notify, Class, INFO_SIZE, MAX_SIZE};
+use crate::{ctrl_req, status, Capabilities, Class, INFO_SIZE, MAX_SIZE};
+
+#[derive(Debug, Clone)]
+struct Cfg {
+    info: Vec<u8>,
+    ping_timeout: Option<Duration>,
+}
+
+impl Default for Cfg {
+    fn default() -> Self {
+        Self { info: Vec::new(), ping_timeout: Some(Duration::from_secs(10)) }
+    }
+}
 
 /// Sends data into a USB packet channel.
 pub struct UpcSender {
     tx: mpsc::Sender<Bytes>,
+    error: watch::Receiver<Option<ErrorKind>>,
 }
 
 impl fmt::Debug for UpcSender {
@@ -48,7 +63,12 @@ impl UpcSender {
     /// ## Cancel safety
     /// If canceled, no data will have been sent.
     pub async fn send(&self, data: Bytes) -> Result<()> {
-        self.tx.send(data).await.map_err(|_| Error::new(ErrorKind::ConnectionReset, "connection closed"))
+        match self.tx.send(data).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                Err(Error::new((*self.error.borrow()).unwrap_or(ErrorKind::ConnectionReset), "connection closed"))
+            }
+        }
     }
 
     /// Wait until connection is closed.
@@ -104,6 +124,7 @@ pub struct UpcReceiver {
     buffer: BytesMut,
     max_size: usize,
     max_packet_size: usize,
+    error: watch::Receiver<Option<ErrorKind>>,
 }
 
 impl fmt::Debug for UpcReceiver {
@@ -125,7 +146,11 @@ impl UpcReceiver {
     pub async fn recv(&mut self) -> Result<Option<BytesMut>> {
         loop {
             let Some(packet) = self.rx.recv().await else {
-                return Ok(None);
+                // Channel closed — check if there was an error or a clean half-close.
+                return match *self.error.borrow() {
+                    Some(kind) => Err(Error::new(kind, "connection closed")),
+                    None => Ok(None),
+                };
             };
             let packet_len = packet.len();
             self.buffer.unsplit(packet);
@@ -188,14 +213,23 @@ impl Stream for UpcStream {
 struct Head {
     tx: mpsc::Sender<BytesMut>,
     rx: mpsc::Receiver<Bytes>,
+    error: watch::Sender<Option<ErrorKind>>,
 }
 
 fn connection(topic: Vec<u8>, max_packet_size: usize) -> (UpcSender, UpcReceiver, Head) {
     let (tx_in, rx_in) = mpsc::channel(32);
     let (tx_out, rx_out) = mpsc::channel(32);
-    let sender = UpcSender { tx: tx_out };
-    let recv = UpcReceiver { topic, rx: rx_in, buffer: BytesMut::new(), max_size: MAX_SIZE, max_packet_size };
-    let head = Head { tx: tx_in, rx: rx_out };
+    let (error_tx, error_rx) = watch::channel(None);
+    let sender = UpcSender { tx: tx_out, error: error_rx.clone() };
+    let recv = UpcReceiver {
+        topic,
+        rx: rx_in,
+        buffer: BytesMut::new(),
+        max_size: MAX_SIZE,
+        max_packet_size,
+        error: error_rx,
+    };
+    let head = Head { tx: tx_in, rx: rx_out, error: error_tx };
     (sender, recv, head)
 }
 
@@ -243,7 +277,7 @@ pub struct UpcFunction {
     name: String,
     task: JoinSet<Result<()>>,
     conn_rx: mpsc::Receiver<(UpcSender, UpcReceiver)>,
-    info: Arc<Mutex<Vec<u8>>>,
+    cfg: Arc<Mutex<Cfg>>,
 }
 
 impl fmt::Debug for UpcFunction {
@@ -274,17 +308,10 @@ impl UpcFunction {
     ) -> Result<(Self, T)> {
         let (ep_rx, ep_rx_dir) = EndpointDirection::host_to_device();
         let (ep_tx, ep_tx_dir) = EndpointDirection::device_to_host();
-        let (ep_notify, ep_notify_dir) = EndpointDirection::device_to_host();
-
-        let mut ep_notify_desc = Endpoint::custom(ep_notify_dir, TransferType::Interrupt);
-        ep_notify_desc.max_packet_size_hs = notify::MAX_PACKET_SIZE as u16;
-        ep_notify_desc.max_packet_size_ss = notify::MAX_PACKET_SIZE as u16;
-        ep_notify_desc.interval = 9;
 
         let mut interface = Interface::new(interface_id.class.into(), &interface_id.name)
             .with_endpoint(Endpoint::bulk(ep_rx_dir))
             .with_endpoint(Endpoint::bulk(ep_tx_dir))
-            .with_endpoint(ep_notify_desc)
             .with_os_ext_compat(OsExtCompat::winusb());
         if let Some(guid) = interface_id.guid {
             interface = interface.with_os_ext_prop(OsExtProp::device_interface_guid(guid));
@@ -294,12 +321,17 @@ impl UpcFunction {
         let (ep0, ret) = build_fn(builder)?;
 
         let (conn_tx, conn_rx) = mpsc::channel(4);
-        let info = Arc::new(Mutex::new(Vec::new()));
+        let cfg = Arc::new(Mutex::new(Cfg::default()));
 
         let mut task = JoinSet::new();
-        task.spawn(Self::task(ep0, ep_tx, ep_rx, ep_notify, conn_tx, info.clone()));
+        task.spawn(Self::task(ep0, ep_tx, ep_rx, conn_tx, cfg.clone()));
 
-        Ok((Self { class: interface_id.class, name: interface_id.name.to_string(), task, conn_rx, info }, ret))
+        Ok((Self { class: interface_id.class, name: interface_id.name.to_string(), task, conn_rx, cfg }, ret))
+    }
+
+    /// Returns the info data readable by host.
+    pub async fn info(&self) -> Vec<u8> {
+        self.cfg.lock().await.info.clone()
     }
 
     /// Sets the info data readable by host.
@@ -308,7 +340,25 @@ impl UpcFunction {
     /// Panics if info is larger than [`INFO_SIZE`].
     pub async fn set_info(&self, info: Vec<u8>) {
         assert!(info.len() <= INFO_SIZE, "info too big");
-        *self.info.lock().await = info;
+        self.cfg.lock().await.info = info;
+    }
+
+    /// Returns the ping timeout duration.
+    pub async fn ping_timeout(&self) -> Option<Duration> {
+        self.cfg.lock().await.ping_timeout
+    }
+
+    /// Sets the ping timeout duration.
+    ///
+    /// If the device does not hear from the host within
+    /// this duration, it considers the host process dead and fails the
+    /// connection.
+    ///
+    /// Set to `None` to disable ping timeout detection.
+    ///
+    /// The default is 10 seconds.
+    pub async fn set_ping_timeout(&self, timeout: Option<Duration>) {
+        self.cfg.lock().await.ping_timeout = timeout;
     }
 
     /// Waits for and accepts an incoming connection.
@@ -377,8 +427,8 @@ impl UpcFunction {
     }
 
     async fn task(
-        mut ep0: Custom, ep_tx: EndpointSender, ep_rx: EndpointReceiver, ep_notify: EndpointSender,
-        conn_tx: mpsc::Sender<(UpcSender, UpcReceiver)>, info: Arc<Mutex<Vec<u8>>>,
+        mut ep0: Custom, ep_tx: EndpointSender, ep_rx: EndpointReceiver,
+        conn_tx: mpsc::Sender<(UpcSender, UpcReceiver)>, cfg: Arc<Mutex<Cfg>>,
     ) -> Result<()> {
         let status = ep0.status();
 
@@ -398,15 +448,24 @@ impl UpcFunction {
 
         let ep_tx = Mutex::new(ep_tx);
         let ep_rx = Mutex::new(ep_rx);
-        let ep_notify = Mutex::new(ep_notify);
 
         let mut in_task = future::pending().boxed();
         let mut out_task = future::pending().boxed();
 
         let mut send_open = false;
         let mut recv_open = false;
+        let mut last_status = Instant::now();
+        let mut conn_error = watch::channel(None).0;
 
         loop {
+            let timeout_task = async {
+                let ping_timeout = cfg.lock().await.ping_timeout;
+                match ping_timeout {
+                    Some(d) => tokio::time::sleep_until(last_status + d).await,
+                    None => future::pending().await,
+                }
+            };
+
             tokio::select! {
                 () = &mut unbound => {
                     tracing::debug!("device unbound");
@@ -434,7 +493,6 @@ impl UpcFunction {
                             out_task = future::pending().boxed();
                             ep_tx.lock().await.cancel()?;
                             ep_rx.lock().await.cancel()?;
-                            ep_notify.lock().await.cancel()?;
                             send_open = false;
                             recv_open = false;
                             max_packet_size = None;
@@ -465,12 +523,14 @@ impl UpcFunction {
 
                                     match req.recv_all() {
                                         Ok(topic) => {
-                                            let (ctx, crx, Head { tx, rx }) = connection(topic, max_packet_size.unwrap());
+                                            let (ctx, crx, Head { tx, rx, error }) = connection(topic, max_packet_size.unwrap());
                                             let _ = conn_tx.send((ctx, crx)).await;
                                             in_task = Self::in_task(&ep_rx, tx).boxed();
                                             out_task = Self::out_task(&ep_tx, rx).boxed();
                                             send_open = true;
                                             recv_open = true;
+                                            last_status = Instant::now();
+                                            conn_error = error;
                                             tracing::debug!("connection established");
                                         }
                                         Err(err) => {
@@ -486,7 +546,6 @@ impl UpcFunction {
                                     out_task = future::pending().boxed();
                                     ep_tx.lock().await.cancel()?;
                                     ep_rx.lock().await.cancel()?;
-                                    ep_notify.lock().await.cancel()?;
                                     if let Err(err) = req.recv_all() {
                                         tracing::warn!("close request receive error: {err}");
                                     }
@@ -532,10 +591,37 @@ impl UpcFunction {
                             match ctrl_req.request {
                                 ctrl_req::INFO => {
                                     tracing::debug!("sending info");
-                                    if let Err(err) = req.send(&info.lock().await) {
+                                    if let Err(err) = req.send(&cfg.lock().await.info) {
                                         tracing::warn!("info send error: {err}");
                                     }
                                 }
+
+                                ctrl_req::CAPABILITIES => {
+                                    tracing::debug!("sending capabilities");
+                                    let cfg = cfg.lock().await;
+                                    let caps = Capabilities {
+                                        ping_timeout: cfg.ping_timeout,
+                                        status_supported: true,
+                                    };
+                                    if let Err(err) = req.send(&caps.encode()) {
+                                        tracing::warn!("capabilities send error: {err}");
+                                    }
+                                }
+
+                                ctrl_req::STATUS => {
+                                    last_status = Instant::now();
+                                    let mut buf = [0u8; status::MAX_SIZE];
+                                    let mut len = 0;
+                                    if !recv_open {
+                                        buf[len] = status::RECV_CLOSED;
+                                        len += 1;
+                                    }
+                                    tracing::debug!("sending status ({len} bytes)");
+                                    if let Err(err) = req.send(&buf[..len]) {
+                                        tracing::warn!("status send error: {err}");
+                                    }
+                                }
+
                                 other => tracing::warn!("unknown control request {other:x}"),
                             }
                         }
@@ -544,9 +630,22 @@ impl UpcFunction {
                     }
                 }
 
+                () = timeout_task, if send_open || recv_open => {
+                    tracing::warn!("host ping timeout, closing connection");
+                    let _ = conn_error.send(Some(ErrorKind::TimedOut));
+                    in_task = future::pending().boxed();
+                    out_task = future::pending().boxed();
+                    ep_tx.lock().await.cancel()?;
+                    ep_rx.lock().await.cancel()?;
+                    send_open = false;
+                    recv_open = false;
+                    last_status = Instant::now();
+                }
+
                 res = &mut in_task => {
-                    // in_task ended: device-side UpcReceiver was dropped
-                    // Halt the OUT endpoint and send notification to signal the host.
+                    // in_task ended: device-side UpcReceiver was dropped.
+                    // Halt the OUT endpoint; the host will learn about this
+                    // via the next STATUS poll or via a STALL on the OUT endpoint.
                     match res {
                         Ok(()) => tracing::debug!("device receiver dropped"),
                         Err(err) => tracing::warn!("device receiver failed: {err}")
@@ -554,9 +653,6 @@ impl UpcFunction {
                     recv_open = false;
                     in_task = future::pending().boxed();
                     ep_rx.lock().await.cancel()?;
-                    if let Err(err) = ep_notify.lock().await.send_async(Bytes::from_static(&[notify::CLOSE_RECV])).await {
-                        tracing::warn!("failed to send close-recv notification: {err}");
-                    }
                     let _ = ep_rx.lock().await.control()?.halt();
                     tracing::debug!("OUT endpoint halted (device done receiving)");
                 }

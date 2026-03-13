@@ -24,6 +24,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::sync::mpsc;
 
@@ -38,6 +39,40 @@ pub use web::*;
 mod native;
 #[cfg(not(feature = "web"))]
 pub use native::*;
+
+/// Device status reported by the periodic STATUS control request.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeviceStatus {
+    /// Device receiver has been dropped (device done receiving).
+    pub(crate) recv_closed: bool,
+    /// Device is unreachable (ping timed out).
+    pub(crate) dead: bool,
+}
+
+/// Options for connecting to a USB packet channel.
+#[derive(Debug, Clone)]
+pub struct UpcOptions {
+    /// Topic data provided to the device. Contains user-defined data.
+    ///
+    /// The maximum size is [`crate::INFO_SIZE`].
+    pub topic: Vec<u8>,
+
+    /// Requested interval for pinging the device.
+    ///
+    /// The actual ping interval is the minimum of this value and half
+    /// the device's ping timeout (set via [`crate::device::UpcFunction::set_ping_timeout`]).
+    /// If the device does not support status polling, it is disabled
+    /// regardless of this setting.
+    ///
+    /// The default is 5 seconds.
+    pub ping_interval: Option<Duration>,
+}
+
+impl Default for UpcOptions {
+    fn default() -> Self {
+        Self { topic: Vec::new(), ping_interval: Some(Duration::from_secs(5)) }
+    }
+}
 
 /// Sends data into a USB packet channel.
 pub struct UpcSender {

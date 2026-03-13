@@ -1,80 +1,91 @@
-use std::fmt;
-use tokio::sync::oneshot;
-use wasm_bindgen::{prelude::*, JsCast};
-use web_sys::Event;
+//! Shared test utilities for integration tests.
 
-/// Log to console.
-#[macro_export]
-macro_rules! log {
-    ($($arg:tt)*) => {
-        web_sys::console::log_1(&::wasm_bindgen::JsValue::from_str(&format!($($arg)*)));
-    }
+#![allow(dead_code)]
+
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
+
+use upc::{
+    device::{InterfaceId, UpcFunction},
+    host::{connect, find_interface},
+    Class,
+};
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+pub const VID: u16 = 4;
+pub const PID: u16 = 5;
+pub const ROUNDS: usize = 3;
+
+pub const CLASS: Class = Class::vendor_specific(22, 3);
+pub const DEVICE_CLASS: Class = Class::vendor_specific(0xff, 0);
+
+// ── Logging initializer ─────────────────────────────────────────────────────
+
+pub fn init_log() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
+        tracing_log::LogTracer::init().unwrap();
+    });
 }
 
-#[track_caller]
-pub fn log_and_panic(msg: &str) -> ! {
-    web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(msg));
-    panic!("{msg}")
+// ── Helpers: set up gadget, then connect per round ───────────────────────────
+
+pub struct TestSetup {
+    pub _reg: Box<dyn std::any::Any + Send>,
 }
 
-#[macro_export]
-macro_rules! panic_log {
-    ($($arg:tt)*) => {
-        $crate::util::log_and_panic(&format!($($arg)*))
-    }
-}
+pub async fn setup_gadget(
+    test_name: &str, iface_name: &str, gadget_name: &str,
+) -> (UpcFunction, nusb::DeviceInfo, u8, TestSetup) {
+    usb_gadget::remove_all().expect("cannot remove all USB gadgets");
+    sleep(Duration::from_secs(1)).await;
 
-pub trait ResultExt<T> {
-    #[track_caller]
-    fn expect_log(self, msg: &str) -> T;
-}
+    println!("[{test_name}] Creating UPC function…");
+    let (upc_fn, hnd) = UpcFunction::new(InterfaceId::new(CLASS).with_name(iface_name));
 
-impl<T, E> ResultExt<T> for Result<T, E>
-where
-    E: fmt::Display,
-{
-    #[track_caller]
-    fn expect_log(self, msg: &str) -> T {
-        match self {
-            Ok(v) => v,
-            Err(err) => panic_log!("{msg}: {err}"),
+    println!("[{test_name}] Registering gadget…");
+    let udc = default_udc().expect("cannot get UDC");
+    let mut gadget = Gadget::new(DEVICE_CLASS.into(), Id::new(VID, PID), Strings::new(gadget_name, "test", "0"))
+        .with_config(Config::new("config").with_function(hnd))
+        .with_os_descriptor(OsDescriptor::microsoft());
+    gadget.device_release = 0x0110;
+    let reg = gadget.bind(&udc).expect("cannot bind to UDC");
+    assert!(reg.is_attached(), "gadget is not attached");
+
+    println!("[{test_name}] Waiting for host enumeration…");
+    sleep(Duration::from_secs(3)).await;
+
+    let dev_info = {
+        let mut found = None;
+        for attempt in 0..10 {
+            if let Some(di) = nusb::list_devices()
+                .await
+                .expect("cannot enumerate USB devices")
+                .find(|c| c.vendor_id() == VID && c.product_id() == PID)
+            {
+                found = Some(di);
+                break;
+            }
+            println!("[{test_name}] Device not found yet (attempt {attempt}), retrying…");
+            sleep(Duration::from_secs(1)).await;
         }
-    }
-}
-
-impl<T> ResultExt<T> for Option<T> {
-    #[track_caller]
-    fn expect_log(self, msg: &str) -> T {
-        match self {
-            Some(v) => v,
-            None => panic_log!("{msg}"),
-        }
-    }
-}
-
-/// Wait for a click event on the page until user interaction is enabled.
-pub async fn wait_for_interaction(msg: &str) {
-    log!("Waiting for user interaction on page");
-
-    let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let body = document.body().unwrap();
-
-    let message = document.create_element("div").unwrap();
-    message.set_inner_html(msg);
-    body.append_child(&message).unwrap();
-
-    let click_future = async {
-        let (sender, receiver) = oneshot::channel::<()>();
-        let closure = Closure::once(move |_event: Event| {
-            let _ = sender.send(());
-        });
-        body.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref()).unwrap();
-        receiver.await.unwrap();
-        body.remove_event_listener_with_callback("click", closure.as_ref().unchecked_ref()).unwrap();
+        found.expect("device not found on USB bus")
     };
 
-    click_future.await;
+    println!("[{test_name}] Finding interface…");
+    let iface_num = find_interface(&dev_info, CLASS).expect("cannot find interface");
 
-    body.remove_child(&message).unwrap();
+    (upc_fn, dev_info, iface_num, TestSetup { _reg: Box::new(reg) })
+}
+
+pub async fn host_connect(
+    dev_info: &nusb::DeviceInfo, iface_num: u8, topic: &[u8],
+) -> (upc::host::UpcSender, upc::host::UpcReceiver) {
+    let dev = dev_info.open().await.expect("cannot open device");
+    connect(dev, iface_num, topic).await.expect("connect failed")
 }

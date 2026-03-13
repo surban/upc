@@ -15,8 +15,8 @@ use webusb_web::{Usb, UsbDeviceFilter};
 mod common;
 use common::*;
 
-mod util;
-use util::{wait_for_interaction, ResultExt};
+mod web_util;
+use web_util::{wait_for_interaction, ResultExt};
 
 const FILTER: UsbDeviceFilter = UsbDeviceFilter::new().with_vendor_id(VID).with_product_id(PID);
 

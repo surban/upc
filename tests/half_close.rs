@@ -9,94 +9,22 @@
 
 #![cfg(all(feature = "host", feature = "device"))]
 
-use std::time::Duration;
+mod util;
+
 use bytes::Bytes;
-use tokio::time::{sleep, timeout};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
 use serial_test::serial;
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
+use util::*;
 
-use upc::{
-    device::{InterfaceId, UpcFunction},
-    host::{connect, find_interface},
-    Class,
-};
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-const VID: u16 = 4;
-const PID: u16 = 5;
-const ROUNDS: usize = 3;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-const CLASS: Class = Class::vendor_specific(22, 3);
-const DEVICE_CLASS: Class = Class::vendor_specific(0xff, 0);
-
-// ── Logging initializer ─────────────────────────────────────────────────────
-
-fn init_log() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
-        tracing_log::LogTracer::init().unwrap();
-    });
+async fn setup(test_name: &str) -> (upc::device::UpcFunction, nusb::DeviceInfo, u8, TestSetup) {
+    setup_gadget(test_name, "HALF-CLOSE TEST", "upc-halfclose").await
 }
 
-// ── Helpers: set up gadget, then connect per round ───────────────────────────
-
-struct TestSetup {
-    _reg: Box<dyn std::any::Any + Send>,
-}
-
-async fn setup_gadget(test_name: &str) -> (UpcFunction, nusb::DeviceInfo, u8, TestSetup) {
-    usb_gadget::remove_all().expect("cannot remove all USB gadgets");
-    sleep(Duration::from_secs(1)).await;
-
-    println!("[{test_name}] Creating UPC function…");
-    let (upc_fn, hnd) = UpcFunction::new(InterfaceId::new(CLASS).with_name("HALF-CLOSE TEST"));
-
-    println!("[{test_name}] Registering gadget…");
-    let udc = default_udc().expect("cannot get UDC");
-    let mut gadget =
-        Gadget::new(DEVICE_CLASS.into(), Id::new(VID, PID), Strings::new("upc-halfclose", "test", "0"))
-            .with_config(Config::new("config").with_function(hnd))
-            .with_os_descriptor(OsDescriptor::microsoft());
-    gadget.device_release = 0x0110;
-    let reg = gadget.bind(&udc).expect("cannot bind to UDC");
-    assert!(reg.is_attached(), "gadget is not attached");
-
-    println!("[{test_name}] Waiting for host enumeration…");
-    sleep(Duration::from_secs(3)).await;
-
-    let dev_info = {
-        let mut found = None;
-        for attempt in 0..10 {
-            if let Some(di) = nusb::list_devices()
-                .await
-                .expect("cannot enumerate USB devices")
-                .find(|c| c.vendor_id() == VID && c.product_id() == PID)
-            {
-                found = Some(di);
-                break;
-            }
-            println!("[{test_name}] Device not found yet (attempt {attempt}), retrying…");
-            sleep(Duration::from_secs(1)).await;
-        }
-        found.expect("device not found on USB bus")
-    };
-
-    println!("[{test_name}] Finding interface…");
-    let iface_num = find_interface(&dev_info, CLASS).expect("cannot find interface");
-
-    (upc_fn, dev_info, iface_num, TestSetup { _reg: Box::new(reg) })
-}
-
-async fn host_connect(
-    dev_info: &nusb::DeviceInfo, iface_num: u8,
-) -> (upc::host::UpcSender, upc::host::UpcReceiver) {
-    let dev = dev_info.open().await.expect("cannot open device");
-    connect(dev, iface_num, b"halfclose").await.expect("connect failed")
+async fn connect(dev_info: &nusb::DeviceInfo, iface_num: u8) -> (upc::host::UpcSender, upc::host::UpcReceiver) {
+    host_connect(dev_info, iface_num, b"halfclose").await
 }
 
 // ── Test 1: Host drops sender, device can still send ────────────────────────
@@ -105,11 +33,11 @@ async fn host_connect(
 #[serial]
 async fn host_close_send() {
     init_log();
-    let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("host_close_send").await;
+    let (mut upc_fn, dev_info, iface_num, _setup) = setup("host_close_send").await;
 
     for round in 0..ROUNDS {
         println!("\n[host_close_send] ── Round {round} ──");
-        let (host_tx, mut host_rx) = host_connect(&dev_info, iface_num).await;
+        let (host_tx, mut host_rx) = connect(&dev_info, iface_num).await;
         let (dev_tx, mut dev_rx) = upc_fn.accept().await.expect("accept failed");
 
         let device_task = tokio::spawn(async move {
@@ -155,11 +83,11 @@ async fn host_close_send() {
 #[serial]
 async fn host_close_recv() {
     init_log();
-    let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("host_close_recv").await;
+    let (mut upc_fn, dev_info, iface_num, _setup) = setup("host_close_recv").await;
 
     for round in 0..ROUNDS {
         println!("\n[host_close_recv] ── Round {round} ──");
-        let (host_tx, host_rx) = host_connect(&dev_info, iface_num).await;
+        let (host_tx, host_rx) = connect(&dev_info, iface_num).await;
         let (dev_tx, mut dev_rx) = upc_fn.accept().await.expect("accept failed");
 
         let device_task = tokio::spawn(async move {
@@ -208,11 +136,11 @@ async fn host_close_recv() {
 #[serial]
 async fn device_close_send() {
     init_log();
-    let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("device_close_send").await;
+    let (mut upc_fn, dev_info, iface_num, _setup) = setup("device_close_send").await;
 
     for round in 0..ROUNDS {
         println!("\n[device_close_send] ── Round {round} ──");
-        let (host_tx, mut host_rx) = host_connect(&dev_info, iface_num).await;
+        let (host_tx, mut host_rx) = connect(&dev_info, iface_num).await;
         let (dev_tx, mut dev_rx) = upc_fn.accept().await.expect("accept failed");
 
         let device_task = tokio::spawn(async move {
@@ -264,11 +192,11 @@ async fn device_close_send() {
 #[serial]
 async fn device_close_recv() {
     init_log();
-    let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("device_close_recv").await;
+    let (mut upc_fn, dev_info, iface_num, _setup) = setup("device_close_recv").await;
 
     for round in 0..ROUNDS {
         println!("\n[device_close_recv] ── Round {round} ──");
-        let (host_tx, mut host_rx) = host_connect(&dev_info, iface_num).await;
+        let (host_tx, mut host_rx) = connect(&dev_info, iface_num).await;
         let (dev_tx, dev_rx) = upc_fn.accept().await.expect("accept failed");
 
         let device_task = tokio::spawn(async move {
@@ -325,16 +253,16 @@ async fn device_close_recv() {
 #[serial]
 async fn device_close_recv_notify() {
     init_log();
-    let (mut upc_fn, dev_info, iface_num, _setup) = setup_gadget("device_close_recv_notify").await;
+    let (mut upc_fn, dev_info, iface_num, _setup) = setup("device_close_recv_notify").await;
 
     for round in 0..ROUNDS {
         println!("\n[device_close_recv_notify] ── Round {round} ──");
-        let (host_tx, mut host_rx) = host_connect(&dev_info, iface_num).await;
+        let (host_tx, mut host_rx) = connect(&dev_info, iface_num).await;
         let (dev_tx, dev_rx) = upc_fn.accept().await.expect("accept failed");
 
         let device_task = tokio::spawn(async move {
-            // Device drops receiver — this should trigger CLOSE_RECV notification
-            // via the interrupt endpoint so the idle host sender can detect it.
+            // Device drops receiver — this should trigger CLOSE_RECV status
+            // via the next STATUS poll so the idle host sender can detect it.
             println!("[device] Dropping receiver…");
             drop(dev_rx);
 
@@ -350,7 +278,7 @@ async fn device_close_recv_notify() {
         });
 
         // Host does NOT send any data — instead it waits for the closed() signal
-        // which must arrive via the interrupt notification endpoint.
+        // which must arrive via the STATUS control request poll.
         println!("[host] Waiting for sender closed() event…");
         timeout(TIMEOUT, host_tx.closed()).await.expect("closed() timed out — notification not received");
         println!("[host] Sender closed() returned");
