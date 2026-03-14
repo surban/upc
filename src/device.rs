@@ -10,7 +10,7 @@ use std::{
     fmt,
     future::Future,
     io::{Error, ErrorKind, Result},
-    mem::take,
+    mem::{replace, take},
     path::Path,
     pin::{pin, Pin},
     sync::Arc,
@@ -38,11 +38,17 @@ struct Cfg {
     info: Vec<u8>,
     ping_timeout: Option<Duration>,
     max_packet_size: u64,
+    recv_pool_size: usize,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
-        Self { info: Vec::new(), ping_timeout: Some(Duration::from_secs(10)), max_packet_size: MAX_SIZE as u64 }
+        Self {
+            info: Vec::new(),
+            ping_timeout: Some(Duration::from_secs(10)),
+            max_packet_size: MAX_SIZE as u64,
+            recv_pool_size: 5 * 1024 * 1024,
+        }
     }
 }
 
@@ -166,6 +172,7 @@ impl UpcReceiver {
                     None => Ok(None),
                 };
             };
+
             let packet_len = packet.len();
             self.buffer.unsplit(packet);
 
@@ -216,6 +223,31 @@ impl Stream for UpcStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).0.poll_next_unpin(cx)
+    }
+}
+
+/// Pre-allocated buffer pool for zero-copy reassembly.
+///
+/// Most chunks carved from the same pool are contiguous in memory,
+/// so [`BytesMut::unsplit`] can merge them without copying.
+struct BytesPool {
+    buf: BytesMut,
+    pool_size: usize,
+}
+
+impl BytesPool {
+    /// Create a new pool of specified size.
+    fn new(pool_size: usize) -> Self {
+        Self { buf: BytesMut::with_capacity(pool_size), pool_size }
+    }
+
+    /// Take one chunk from the pool, reallocating if exhausted.
+    fn chunk(&mut self, chunk_size: usize) -> BytesMut {
+        if self.buf.capacity() < chunk_size {
+            self.buf = BytesMut::with_capacity(self.pool_size.max(chunk_size));
+        }
+        let remaining = self.buf.split_off(chunk_size);
+        replace(&mut self.buf, remaining)
     }
 }
 
@@ -388,6 +420,23 @@ impl UpcFunction {
         self.cfg.lock().await.max_packet_size = max_size;
     }
 
+    /// Returns the receive pool size in bytes.
+    pub async fn recv_pool_size(&self) -> usize {
+        self.cfg.lock().await.recv_pool_size
+    }
+
+    /// Sets the receive pool size in bytes.
+    ///
+    /// The receive pool pre-allocates a contiguous buffer so that
+    /// consecutive USB transfers can be merged without copying
+    /// during packet reassembly. A larger pool reduces the number
+    /// of copies at the cost of higher memory usage.
+    ///
+    /// The default is 5 MB.
+    pub async fn set_recv_pool_size(&self, size: usize) {
+        self.cfg.lock().await.recv_pool_size = size;
+    }
+
     /// Waits for and accepts an incoming connection.
     ///
     /// ## Cancel safety
@@ -408,11 +457,13 @@ impl UpcFunction {
     /// `false` if the device-side receiver was dropped.
     async fn in_task(
         ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<BytesMut>, mut close_rx: watch::Receiver<Option<u64>>,
+        pool_size: usize,
     ) -> Result<bool> {
         let mut ep_rx = ep_rx.lock().await;
         let max_packet_size = ep_rx.max_packet_size()?;
         let tx2 = tx.clone();
         let mut total_received: u64 = 0;
+        let mut pool = BytesPool::new(pool_size);
 
         loop {
             // Check if we have already received all bytes the host sent.
@@ -431,9 +482,10 @@ impl UpcFunction {
             // UpcReceiver has been dropped (so we can send the CLOSE_RECV
             // notification promptly even when the host is idle), and
             // the host signaling CLOSE_SEND with a byte count.
+            let chunk = pool.chunk(max_packet_size);
             tokio::select! {
                 biased;
-                res = ep_rx.recv_async(BytesMut::with_capacity(max_packet_size)) => {
+                res = ep_rx.recv_async(chunk) => {
                     if let Some(data) = res? {
                         total_received = total_received.wrapping_add(data.len() as u64);
                         #[cfg(feature = "trace-packets")]
@@ -584,7 +636,8 @@ impl UpcFunction {
                                             let (ctx, crx, Head { tx, rx, error }) = connection(topic, max_packet_size.unwrap(), max_send_size, max_recv_packet_size);
                                             let _ = conn_tx.send((ctx, crx)).await;
                                             let (close_tx, close_rx) = watch::channel(None);
-                                            in_task = Self::in_task(&ep_rx, tx, close_rx).boxed();
+                                            let recv_pool_size = cfg.lock().await.recv_pool_size;
+                                            in_task = Self::in_task(&ep_rx, tx, close_rx, recv_pool_size).boxed();
                                             out_task = Self::out_task(&ep_tx, rx).boxed();
                                             in_close_tx = close_tx;
                                             send_open = true;
