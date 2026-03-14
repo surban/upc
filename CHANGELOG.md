@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning].
 - `UpcFunction::set_max_size()` and `UpcFunction::max_size()` on device side
 - host and device capabilities exchange (TLV-encoded max packet size negotiation)
 - `probe()` function for auto-discovery of UPC interfaces
-- `upc` CLI tool with `scan`, `probe`, `connect`, and `device` subcommands (feature `cli`)
+- `upc` CLI tool with `scan`, `list`, `connect`, and `device` subcommands (feature `cli`)
 - retry logic for claiming USB interface on connect
 
 ### Changed

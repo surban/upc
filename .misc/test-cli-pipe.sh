@@ -37,11 +37,11 @@ trap cleanup EXIT
 pass() { PASS=$((PASS + 1)); echo "PASS"; }
 fail() { FAIL=$((FAIL + 1)); echo "FAIL: $*"; }
 
-# Wait until a UPC gadget is visible via probe.
+# Wait until a UPC gadget is visible via scan.
 wait_gadget() {
     local i
     for i in $(seq 1 50); do
-        if "$UPC" probe 2>/dev/null | grep -q .; then
+        if "$UPC" scan 2>/dev/null | grep -q .; then
             sleep 0.3; return 0
         fi
         sleep 0.2
@@ -53,7 +53,7 @@ wait_gadget() {
 wait_no_gadget() {
     local i
     for i in $(seq 1 25); do
-        if ! "$UPC" probe 2>/dev/null | grep -q .; then
+        if ! "$UPC" scan 2>/dev/null | grep -q .; then
             return 0
         fi
         sleep 0.2
