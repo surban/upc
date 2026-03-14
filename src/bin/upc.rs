@@ -258,9 +258,9 @@ struct DeviceFilter {
     #[arg(long)]
     serial: Option<String>,
 
-    /// Filter by USB bus number.
+    /// Filter by USB bus identifier.
     #[arg(long)]
-    bus: Option<u8>,
+    bus: Option<String>,
 
     /// Filter by USB device address.
     #[arg(long)]
@@ -297,8 +297,8 @@ impl DeviceFilter {
                 return false;
             }
         }
-        if let Some(bus) = self.bus {
-            if dev.busnum() != bus {
+        if let Some(bus) = &self.bus {
+            if dev.bus_id() != bus {
                 return false;
             }
         }
@@ -404,10 +404,10 @@ impl ProbeCmd {
 
             if self.all {
                 println!(
-                    "Device {:04x}:{:04x} on {:03}:{:03} - {} {}{}",
+                    "Device {:04x}:{:04x} on {}:{:03} - {} {}{}",
                     dev_info.vendor_id(),
                     dev_info.product_id(),
-                    dev_info.busnum(),
+                    dev_info.bus_id(),
                     dev_info.device_address(),
                     dev_info.manufacturer_string().unwrap_or("?"),
                     dev_info.product_string().unwrap_or("?"),
@@ -465,10 +465,10 @@ impl ProbeCmd {
                     println!("    UPC info: {info_str}");
                 } else {
                     println!(
-                        "{:04x}:{:04x}\t{:03}:{:03}\t{}\t{}\t{:02x}\t{}",
+                        "{:04x}:{:04x}\t{}:{:03}\t{}\t{}\t{:02x}\t{}",
                         dev_info.vendor_id(),
                         dev_info.product_id(),
-                        dev_info.busnum(),
+                        dev_info.bus_id(),
                         dev_info.device_address(),
                         dev_info.serial_number().unwrap_or(""),
                         iface_num,
