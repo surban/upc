@@ -126,7 +126,7 @@ fn is_broken_pipe(err: &io::Error) -> bool {
 }
 
 /// Forward data between stdin/stdout and a UPC channel.
-async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing) -> io::Result<()> {
+async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing, keep: bool) -> io::Result<()> {
     let mut stdin = tokio::io::stdin();
     let stdout = io::stdout();
 
@@ -197,7 +197,9 @@ async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing)
             }
             Framing::Auto => unreachable!(),
         };
-        close_stdin();
+        if !keep {
+            close_stdin();
+        }
         if interactive {
             stdin_closed2.notify_one();
         }
@@ -234,7 +236,9 @@ async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing)
                 () = &mut idle_timeout => break Ok(()),
             }
         };
-        close_stdout();
+        if !keep {
+            close_stdout();
+        }
         res
     };
 
@@ -362,6 +366,10 @@ impl DeviceFilter {
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Print connection events to stderr.
+    #[arg(long, short)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -540,7 +548,7 @@ struct ConnectCmd {
 
 #[cfg(feature = "host")]
 impl ConnectCmd {
-    async fn exec(self) -> ExitCode {
+    async fn exec(self, verbose: bool) -> ExitCode {
         use upc::host::{connect_with, UpcOptions};
 
         let devices: Vec<_> = match nusb::list_devices().await {
@@ -577,6 +585,16 @@ impl ConnectCmd {
             return ExitCode::FAILURE;
         };
 
+        if verbose {
+            eprintln!(
+                "Connecting to {:04x}:{:04x} on {}:{:03} interface {iface_num}...",
+                dev_info.vendor_id(),
+                dev_info.product_id(),
+                dev_info.bus_id(),
+                dev_info.device_address(),
+            );
+        }
+
         let dev = match dev_info.open().await {
             Ok(dev) => dev,
             Err(err) => {
@@ -595,8 +613,17 @@ impl ConnectCmd {
             }
         };
 
-        match forward_stdio(tx, rx, self.framing).await {
-            Ok(()) => std::process::exit(0),
+        if verbose {
+            eprintln!("Connected.");
+        }
+
+        match forward_stdio(tx, rx, self.framing, false).await {
+            Ok(()) => {
+                if verbose {
+                    eprintln!("Disconnected.");
+                }
+                std::process::exit(0)
+            }
             Err(err) => {
                 eprintln!("Error: {err:#}");
                 std::process::exit(1);
@@ -657,11 +684,15 @@ struct DeviceCmd {
     /// Stdin framing mode.
     #[arg(long, value_enum, default_value_t = Framing::Auto)]
     framing: Framing,
+
+    /// Keep running and accept new connections after the current one ends.
+    #[arg(long, short)]
+    keep: bool,
 }
 
 #[cfg(feature = "device")]
 impl DeviceCmd {
-    async fn exec(self) -> ExitCode {
+    async fn exec(self, verbose: bool) -> ExitCode {
         use std::process;
 
         use upc::device::{InterfaceId, UpcFunction};
@@ -717,19 +748,42 @@ impl DeviceCmd {
             }
         };
 
-        let (tx, rx) = match upc.accept().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                eprintln!("Accept failed: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
+        if verbose {
+            eprintln!("Waiting for connection...");
+        }
 
-        match forward_stdio(tx, rx, self.framing).await {
-            Ok(()) => process::exit(0),
-            Err(err) => {
-                eprintln!("Error: {err:#}");
-                process::exit(1);
+        loop {
+            let (tx, rx) = match upc.accept().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    eprintln!("Accept failed: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            if verbose {
+                eprintln!("Connection accepted.");
+            }
+
+            match forward_stdio(tx, rx, self.framing, self.keep).await {
+                Ok(()) => {
+                    if verbose {
+                        eprintln!("Connection ended.");
+                    }
+                    if !self.keep {
+                        process::exit(0);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Connection error: {err:#}");
+                    if !self.keep {
+                        process::exit(1);
+                    }
+                }
+            }
+
+            if verbose {
+                eprintln!("Waiting for next connection...");
             }
         }
     }
@@ -751,8 +805,8 @@ async fn main() -> ExitCode {
         #[cfg(feature = "host")]
         Command::Probe(cmd) => cmd.exec().await,
         #[cfg(feature = "host")]
-        Command::Connect(cmd) => cmd.exec().await,
+        Command::Connect(cmd) => cmd.exec(cli.verbose).await,
         #[cfg(feature = "device")]
-        Command::Device(cmd) => cmd.exec().await,
+        Command::Device(cmd) => cmd.exec(cli.verbose).await,
     }
 }
