@@ -26,7 +26,9 @@ use crate::{ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_
 const TIMEOUT: Duration = Duration::from_secs(1);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const BUFFER_COUNT: usize = 16;
+const DMA_BUFFERS: usize = 16;
+const CHANNEL_CAPACITY: usize = 64;
+const TRANSFER_PACKETS: usize = 512;
 
 /// A received DMA buffer that is returned to the in_task for reuse on drop.
 pub(crate) struct RecvPacket {
@@ -321,7 +323,7 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
         return Err(Error::new(ErrorKind::NotFound, "transfer endpoints not found"));
     };
-    let max_transfer_size = max_packet_size * 128;
+    let max_transfer_size = max_packet_size * TRANSFER_PACKETS;
 
     // Open device and claim interface.
     // Retry if the interface is still busy from a previous connection whose
@@ -430,12 +432,12 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     }
 
     let error_in = error.clone();
-    let (tx_in, rx_in) = mpsc::channel(BUFFER_COUNT);
+    let (tx_in, rx_in) = mpsc::channel(CHANNEL_CAPACITY);
     let half_close_in = half_close.clone();
     let status_rx_in = status_rx.clone();
     tokio::spawn(in_task(ep_in, tx_in, error_in, max_transfer_size, half_close_in, status_rx_in));
 
-    let (tx_out, rx_out) = mpsc::channel(BUFFER_COUNT);
+    let (tx_out, rx_out) = mpsc::channel(CHANNEL_CAPACITY);
     let error_out = error.clone();
     let half_close_out = half_close.clone();
     tokio::spawn(out_task(ep_out, rx_out, error_out, max_packet_size, half_close_out, status_rx));
@@ -459,7 +461,7 @@ async fn in_task(
 
     let host_initiated = {
         // Pre-submit DMA buffers.
-        for _ in 0..BUFFER_COUNT {
+        for _ in 0..DMA_BUFFERS {
             ep.submit(ep.allocate(max_transfer_size));
         }
 
@@ -562,7 +564,7 @@ async fn out_task(
                 let pending = ep.pending();
                 if pending == 0 {
                     None
-                } else if pending >= BUFFER_COUNT {
+                } else if pending >= DMA_BUFFERS {
                     Some(ep.next_complete().await)
                 } else {
                     ep.next_complete().now_or_never()
