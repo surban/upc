@@ -137,7 +137,7 @@ pub struct UpcReceiver {
     rx: mpsc::Receiver<BytesMut>,
     buffer: BytesMut,
     max_size: usize,
-    max_packet_size: usize,
+    max_transfer_size: usize,
     error: watch::Receiver<Option<ErrorKind>>,
 }
 
@@ -177,7 +177,7 @@ impl UpcReceiver {
                 ));
             }
 
-            if packet_len < self.max_packet_size {
+            if packet_len < self.max_transfer_size {
                 return Ok(Some(take(&mut self.buffer)));
             }
         }
@@ -226,7 +226,7 @@ struct Head {
 }
 
 fn connection(
-    topic: Vec<u8>, max_recv_size: usize, max_send_size: usize, max_recv_packet_size: usize,
+    topic: Vec<u8>, max_transfer_size: usize, max_send_size: usize, max_recv_packet_size: usize,
 ) -> (UpcSender, UpcReceiver, Head) {
     let (tx_in, rx_in) = mpsc::channel(32);
     let (tx_out, rx_out) = mpsc::channel(32);
@@ -237,7 +237,7 @@ fn connection(
         rx: rx_in,
         buffer: BytesMut::new(),
         max_size: max_recv_packet_size,
-        max_packet_size: max_recv_size,
+        max_transfer_size,
         error: error_rx,
     };
     let head = Head { tx: tx_in, rx: rx_out, error: error_tx };
