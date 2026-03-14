@@ -297,7 +297,7 @@ struct DeviceFilter {
     address: Option<u8>,
 
     /// Only probe a specific interface number.
-    #[arg(long, short)]
+    #[arg(long)]
     interface: Option<u8>,
 
     /// Filter by interface subclass (hex).
@@ -376,9 +376,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List USB devices and probe UPC interfaces for info.
+    /// Scan all USB interfaces to discover UPC channels.
     #[cfg(feature = "host")]
-    Probe(ProbeCmd),
+    Scan(ScanCmd),
+
+    /// List UPC interfaces matching class filters and show their info.
+    #[cfg(feature = "host")]
+    List(ListCmd),
 
     /// Connect to a UPC device and forward data to stdin/stdout.
     #[cfg(feature = "host")]
@@ -389,11 +393,11 @@ enum Command {
     Device(DeviceCmd),
 }
 
-// ---- Probe command ----
+// ---- List command ----
 
 #[cfg(feature = "host")]
 #[derive(Parser)]
-struct ProbeCmd {
+struct ListCmd {
     #[command(flatten)]
     filter: DeviceFilter,
 
@@ -403,7 +407,7 @@ struct ProbeCmd {
 }
 
 #[cfg(feature = "host")]
-impl ProbeCmd {
+impl ListCmd {
     async fn exec(&self) -> ExitCode {
         use upc::host::info;
 
@@ -525,13 +529,228 @@ impl ProbeCmd {
     }
 }
 
+// ---- Scan command ----
+
+#[cfg(feature = "host")]
+#[derive(Parser)]
+struct ScanCmd {
+    /// Filter by USB vendor ID (hex).
+    #[arg(long, value_parser = parse_hex_u16)]
+    vid: Option<u16>,
+
+    /// Filter by USB product ID (hex).
+    #[arg(long, value_parser = parse_hex_u16)]
+    pid: Option<u16>,
+
+    /// Filter by USB serial number string.
+    #[arg(long)]
+    serial: Option<String>,
+
+    /// Filter by USB bus identifier.
+    #[arg(long)]
+    bus: Option<String>,
+
+    /// Filter by USB device address.
+    #[arg(long)]
+    address: Option<u8>,
+
+    /// Show all USB devices and interfaces, not just discovered UPC channels.
+    #[arg(long)]
+    all: bool,
+}
+
+#[cfg(feature = "host")]
+impl ScanCmd {
+    fn matches_device(&self, dev: &nusb::DeviceInfo) -> bool {
+        if let Some(vid) = self.vid {
+            if dev.vendor_id() != vid {
+                return false;
+            }
+        }
+        if let Some(pid) = self.pid {
+            if dev.product_id() != pid {
+                return false;
+            }
+        }
+        if let Some(serial) = &self.serial {
+            if dev.serial_number() != Some(serial.as_str()) {
+                return false;
+            }
+        }
+        if let Some(bus) = &self.bus {
+            if dev.bus_id() != bus {
+                return false;
+            }
+        }
+        if let Some(address) = self.address {
+            if dev.device_address() != address {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn exec(&self) -> ExitCode {
+        use upc::host::{info, probe};
+
+        let devices: Vec<_> = match nusb::list_devices().await {
+            Ok(iter) => iter.collect(),
+            Err(err) => {
+                eprintln!("Cannot enumerate USB devices: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut found = false;
+
+        for dev_info in &devices {
+            if !self.matches_device(dev_info) {
+                continue;
+            }
+
+            let vendor_ifaces: Vec<u8> = dev_info
+                .interfaces()
+                .filter(|iface| iface.class() == Class::VENDOR_SPECIFIC)
+                .map(|iface| iface.interface_number())
+                .collect();
+
+            if !self.all && vendor_ifaces.is_empty() {
+                continue;
+            }
+
+            if self.all {
+                println!(
+                    "Device {:04x}:{:04x} on {}:{:03} - {} {}{}",
+                    dev_info.vendor_id(),
+                    dev_info.product_id(),
+                    dev_info.bus_id(),
+                    dev_info.device_address(),
+                    dev_info.manufacturer_string().unwrap_or("?"),
+                    dev_info.product_string().unwrap_or("?"),
+                    dev_info.serial_number().map(|s| format!(" (serial: {s})")).unwrap_or_default(),
+                );
+
+                for iface in dev_info.interfaces() {
+                    let iface_num = iface.interface_number();
+                    let class = Class::new(iface.class(), iface.subclass(), iface.protocol());
+                    println!(
+                        "  Interface {iface_num}: class={:02x} subclass={:02x} protocol={:02x}{}",
+                        class.class,
+                        class.sub_class,
+                        class.protocol,
+                        iface.interface_string().map(|s| format!(" \"{s}\"")).unwrap_or_default(),
+                    );
+                }
+            }
+
+            if vendor_ifaces.is_empty() {
+                continue;
+            }
+
+            let dev = match dev_info.open().await {
+                Ok(d) => d,
+                Err(err) => {
+                    eprintln!("Cannot open {:04x}:{:04x}: {err}", dev_info.vendor_id(), dev_info.product_id());
+                    continue;
+                }
+            };
+
+            for iface_num in vendor_ifaces {
+                match probe(&dev, iface_num).await {
+                    Ok(true) => {
+                        found = true;
+                        let subclass = dev_info
+                            .interfaces()
+                            .find(|i| i.interface_number() == iface_num)
+                            .map(|i| i.subclass())
+                            .unwrap_or(0);
+                        let info_str = match info(&dev, iface_num).await {
+                            Ok(data) => std::str::from_utf8(&data).unwrap_or("").to_string(),
+                            Err(err) => {
+                                tracing::debug!("info read failed on interface {iface_num}: {err}");
+                                String::new()
+                            }
+                        };
+                        if self.all {
+                            println!("    UPC interface {iface_num}: {info_str}");
+                        } else {
+                            println!(
+                                "{:04x}:{:04x}\t{}:{:03}\t{}\t{}\t{:02x}\t{}",
+                                dev_info.vendor_id(),
+                                dev_info.product_id(),
+                                dev_info.bus_id(),
+                                dev_info.device_address(),
+                                dev_info.serial_number().unwrap_or(""),
+                                iface_num,
+                                subclass,
+                                info_str,
+                            );
+                        }
+                    }
+                    Ok(false) => {
+                        if self.all {
+                            println!("    Interface {iface_num}: not UPC");
+                        }
+                    }
+                    Err(err) => {
+                        if self.all {
+                            println!("    Interface {iface_num}: probe failed ({err})");
+                        } else {
+                            tracing::debug!(
+                                "probe failed on {:04x}:{:04x} interface {iface_num}: {err}",
+                                dev_info.vendor_id(),
+                                dev_info.product_id()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found && !self.all {
+            eprintln!("No UPC interfaces found.");
+        }
+
+        ExitCode::SUCCESS
+    }
+}
+
 // ---- Connect command ----
 
 #[cfg(feature = "host")]
 #[derive(Parser)]
 struct ConnectCmd {
-    #[command(flatten)]
-    filter: DeviceFilter,
+    /// Filter by USB vendor ID (hex).
+    #[arg(long, value_parser = parse_hex_u16)]
+    vid: Option<u16>,
+
+    /// Filter by USB product ID (hex).
+    #[arg(long, value_parser = parse_hex_u16)]
+    pid: Option<u16>,
+
+    /// Filter by USB serial number string.
+    #[arg(long)]
+    serial: Option<String>,
+
+    /// Filter by USB bus identifier.
+    #[arg(long)]
+    bus: Option<String>,
+
+    /// Filter by USB device address.
+    #[arg(long)]
+    address: Option<u8>,
+
+    /// Connect to a specific interface number.
+    #[arg(long, short)]
+    interface: Option<u8>,
+
+    /// Filter by interface subclass (hex).
+    #[arg(long, value_parser = parse_hex_u8)]
+    subclass: Option<u8>,
+
+    /// Filter by interface protocol (hex).
+    #[arg(long, value_parser = parse_hex_u8)]
+    protocol: Option<u8>,
 
     /// Topic to send to the device when connecting.
     #[arg(long, default_value = "")]
@@ -548,6 +767,39 @@ struct ConnectCmd {
 
 #[cfg(feature = "host")]
 impl ConnectCmd {
+    fn matches_device(&self, dev: &nusb::DeviceInfo) -> bool {
+        if let Some(vid) = self.vid {
+            if dev.vendor_id() != vid {
+                return false;
+            }
+        }
+        if let Some(pid) = self.pid {
+            if dev.product_id() != pid {
+                return false;
+            }
+        }
+        if let Some(serial) = &self.serial {
+            if dev.serial_number() != Some(serial.as_str()) {
+                return false;
+            }
+        }
+        if let Some(bus) = &self.bus {
+            if dev.bus_id() != bus {
+                return false;
+            }
+        }
+        if let Some(address) = self.address {
+            if dev.device_address() != address {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn has_class_filter(&self) -> bool {
+        self.interface.is_some() || self.subclass.is_some() || self.protocol.is_some()
+    }
+
     async fn exec(self, verbose: bool) -> ExitCode {
         use upc::host::{connect_with, UpcOptions};
 
@@ -559,26 +811,94 @@ impl ConnectCmd {
             }
         };
 
-        let mut found = None;
-        for dev_info in &devices {
-            if !self.filter.matches_device(dev_info) {
-                continue;
-            }
-
-            for iface in dev_info.interfaces() {
-                if !self.filter.matches_interface(iface) {
+        let found = if self.has_class_filter() {
+            // Use class-based filtering when interface/subclass/protocol is specified.
+            let protocol = self.protocol.unwrap_or(0x84);
+            let mut found = None;
+            for dev_info in &devices {
+                if !self.matches_device(dev_info) {
                     continue;
                 }
 
-                if iface.class() == Class::VENDOR_SPECIFIC || self.filter.interface.is_some() {
-                    if found.is_some() {
-                        eprintln!("Multiple matching UPC interfaces found. Use --serial, --vid, --pid, or -i to narrow down.");
-                        return ExitCode::FAILURE;
+                for iface in dev_info.interfaces() {
+                    if let Some(num) = self.interface {
+                        if iface.interface_number() != num {
+                            continue;
+                        }
                     }
-                    found = Some((dev_info.clone(), iface.interface_number()));
+                    if let Some(subclass) = self.subclass {
+                        if iface.subclass() != subclass {
+                            continue;
+                        }
+                    }
+                    if iface.protocol() != protocol {
+                        continue;
+                    }
+
+                    if iface.class() == Class::VENDOR_SPECIFIC || self.interface.is_some() {
+                        if found.is_some() {
+                            eprintln!("Multiple matching UPC interfaces found. Use --serial, --vid, --pid, or -i to narrow down.");
+                            return ExitCode::FAILURE;
+                        }
+                        found = Some((dev_info.clone(), iface.interface_number()));
+                    }
                 }
             }
-        }
+            found
+        } else {
+            // Probe-based auto-discovery when no class filters are specified.
+            use upc::host::probe;
+
+            let mut found = None;
+            for dev_info in &devices {
+                if !self.matches_device(dev_info) {
+                    continue;
+                }
+
+                let vendor_ifaces: Vec<u8> = dev_info
+                    .interfaces()
+                    .filter(|iface| iface.class() == Class::VENDOR_SPECIFIC)
+                    .map(|iface| iface.interface_number())
+                    .collect();
+
+                if vendor_ifaces.is_empty() {
+                    continue;
+                }
+
+                let dev = match dev_info.open().await {
+                    Ok(d) => d,
+                    Err(err) => {
+                        tracing::debug!(
+                            "cannot open {:04x}:{:04x}: {err}",
+                            dev_info.vendor_id(),
+                            dev_info.product_id()
+                        );
+                        continue;
+                    }
+                };
+
+                for iface_num in vendor_ifaces {
+                    match probe(&dev, iface_num).await {
+                        Ok(true) => {
+                            if found.is_some() {
+                                eprintln!("Multiple UPC interfaces found. Use --serial, --vid, --pid, or -i to narrow down.");
+                                return ExitCode::FAILURE;
+                            }
+                            found = Some((dev_info.clone(), iface_num));
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::debug!(
+                                "probe failed on {:04x}:{:04x} interface {iface_num}: {err}",
+                                dev_info.vendor_id(),
+                                dev_info.product_id()
+                            );
+                        }
+                    }
+                }
+            }
+            found
+        };
 
         let Some((dev_info, iface_num)) = found else {
             eprintln!("No matching UPC device found.");
@@ -803,7 +1123,9 @@ async fn main() -> ExitCode {
 
     match cli.command {
         #[cfg(feature = "host")]
-        Command::Probe(cmd) => cmd.exec().await,
+        Command::Scan(cmd) => cmd.exec().await,
+        #[cfg(feature = "host")]
+        Command::List(cmd) => cmd.exec().await,
         #[cfg(feature = "host")]
         Command::Connect(cmd) => cmd.exec(cli.verbose).await,
         #[cfg(feature = "device")]

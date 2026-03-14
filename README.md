@@ -165,19 +165,21 @@ to the host.
 
 ### Host side
 
-Probe for connected UPC devices:
+Scan for all UPC devices on the system:
 
 ```console
-upc probe
+upc scan
 ```
 
-This outputs one tab-separated line per UPC interface:
+This probes every vendor-specific USB interface and outputs one tab-separated
+line per discovered UPC channel:
 
 ```text
 1209:0001	001:005	my-device	0	01	sensor v1
 ```
 
 The columns are: VID:PID, bus:address, serial, interface, subclass, info.
+
 Use `--all` for a human-readable listing of all USB devices.
 
 Connect to a UPC device and forward stdin/stdout:
@@ -185,6 +187,10 @@ Connect to a UPC device and forward stdin/stdout:
 ```console
 upc connect
 ```
+
+Without filter options, `connect` probes all vendor-specific interfaces to
+find a UPC channel automatically. Use `--protocol`, `--subclass`, or `--interface` to
+connect by class filter instead.
 
 License
 -------
