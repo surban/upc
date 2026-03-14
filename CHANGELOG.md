@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
+## 0.9.1 - 2026-03-14
+### Fixed
+- docs.rs build
+
 ## 0.9.0 - 2026-03-14
 ### Added
 - protocol specification document (`PROTOCOL.md`)
