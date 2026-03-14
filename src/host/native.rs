@@ -2,14 +2,6 @@
 
 use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
-use nusb::{
-    descriptors::TransferType,
-    transfer::{
-        Buffer, Bulk, Completion, ControlIn, ControlOut, ControlType, Direction, In, Out, Recipient,
-        TransferError,
-    },
-    Device, DeviceInfo, Endpoint, Interface,
-};
 use std::{
     io::{Error, ErrorKind, Result},
     sync::{Arc, Mutex},
@@ -20,15 +12,25 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+use nusb::{
+    descriptors::TransferType,
+    transfer::{
+        Buffer, Bulk, Completion, ControlIn, ControlOut, ControlType, Direction, In, Out, Recipient,
+        TransferError,
+    },
+    Device, DeviceInfo, Endpoint, Interface,
+};
+
 use super::{DeviceStatus, UpcOptions, UpcReceiver, UpcSender};
-use crate::{ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE};
+use crate::{
+    ctrl_req, status, trace::Tracer, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE, QUEUE_LEN,
+    TRANSFER_PACKETS,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(1);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const DMA_BUFFERS: usize = 8;
-const CHANNEL_CAPACITY: usize = 64;
-const TRANSFER_PACKETS: usize = 512;
 
 /// A received DMA buffer that is returned to the in_task for reuse on drop.
 pub(crate) struct RecvPacket {
@@ -299,7 +301,7 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     // Get endpoints.
     let mut ep_in = None;
     let mut ep_out = None;
-    let mut max_packet_size = usize::MAX;
+    let mut mps = usize::MAX;
     {
         let cfg = dev.active_configuration().map_err(|err| Error::new(ErrorKind::NetworkDown, err))?;
         let iface_desc = cfg
@@ -309,11 +311,11 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
         for ep in iface_desc.first_alt_setting().endpoints() {
             match (ep.direction(), ep.transfer_type()) {
                 (Direction::In, TransferType::Bulk) => {
-                    max_packet_size = max_packet_size.min(ep.max_packet_size());
+                    mps = mps.min(ep.max_packet_size());
                     ep_in = Some(ep.address());
                 }
                 (Direction::Out, TransferType::Bulk) => {
-                    max_packet_size = max_packet_size.min(ep.max_packet_size());
+                    mps = mps.min(ep.max_packet_size());
                     ep_out = Some(ep.address());
                 }
                 _ => {}
@@ -323,7 +325,7 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
         return Err(Error::new(ErrorKind::NotFound, "transfer endpoints not found"));
     };
-    let max_transfer_size = max_packet_size * TRANSFER_PACKETS;
+    let max_transfer_size = mps * TRANSFER_PACKETS;
 
     // Open device and claim interface.
     // Retry if the interface is still busy from a previous connection whose
@@ -359,7 +361,7 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     // Flush buffers.
     tracing::debug!("flushing buffers");
     loop {
-        ep_in.submit(Buffer::new(max_packet_size));
+        ep_in.submit(Buffer::new(mps));
         match timeout(Duration::from_millis(10), ep_in.next_complete()).await {
             Ok(Completion { status: Ok(()), .. }) => (),
             Ok(Completion { status: Err(_), .. }) => break,
@@ -390,7 +392,7 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
 
     // Send host capabilities.
     tracing::debug!("sending host capabilities");
-    let host_caps = HostCapabilities { max_packet_size: options.max_size as u64 };
+    let host_caps = HostCapabilities { max_size: options.max_size as u64 };
     let _ = iface
         .control_out(control_out(ctrl_req::CAPABILITIES, 0, interface.into(), &host_caps.encode()), TIMEOUT)
         .await;
@@ -432,30 +434,41 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     }
 
     let error_in = error.clone();
-    let (tx_in, rx_in) = mpsc::channel(CHANNEL_CAPACITY);
+    let (tx_in, rx_in) = mpsc::channel(QUEUE_LEN);
     let half_close_in = half_close.clone();
     let status_rx_in = status_rx.clone();
-    tokio::spawn(in_task(ep_in, tx_in, error_in, max_transfer_size, half_close_in, status_rx_in));
+    let in_tracer = Tracer::host_in(&name);
+    tokio::spawn(in_task(ep_in, tx_in, error_in, max_transfer_size, half_close_in, status_rx_in, in_tracer));
 
-    let (tx_out, rx_out) = mpsc::channel(CHANNEL_CAPACITY);
+    let (tx_out, rx_out) = mpsc::channel(QUEUE_LEN);
     let error_out = error.clone();
     let half_close_out = half_close.clone();
-    tokio::spawn(out_task(ep_out, rx_out, error_out, max_packet_size, half_close_out, status_rx));
+    let out_tracer = Tracer::host_out(&name);
+    tokio::spawn(out_task(ep_out, rx_out, error_out, mps, half_close_out, status_rx, out_tracer));
 
     // Build objects.
-    let device_max_size = usize::try_from(caps.max_packet_size).unwrap_or(usize::MAX);
+    let device_max_size = usize::try_from(caps.max_size).unwrap_or(usize::MAX);
+    let send_tracer = Tracer::host_enqueue(&name);
+    let recv_tracer = Tracer::host_dequeue(&name);
     let shared = Arc::new(UpcShared { name, error });
-    let sender = UpcSender { tx: tx_out, shared: shared.clone(), max_size: device_max_size };
-    let recv =
-        UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: options.max_size, max_transfer_size };
+    let sender = UpcSender { tx: tx_out, shared: shared.clone(), max_size: device_max_size, tracer: send_tracer };
+    let recv = UpcReceiver {
+        rx: rx_in,
+        shared,
+        buffer: BytesMut::new(),
+        max_size: options.max_size,
+        max_transfer_size,
+        tracer: recv_tracer,
+    };
 
     Ok((sender, recv))
 }
 
+/// Task for performing USB IN transfers.
 async fn in_task(
     mut ep: Endpoint<Bulk, In>, tx: mpsc::Sender<RecvPacket>, error: Arc<Mutex<Option<TaskError>>>,
     max_transfer_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
-    mut status_rx: watch::Receiver<DeviceStatus>,
+    mut status_rx: watch::Receiver<DeviceStatus>, mut tracer: Tracer,
 ) {
     let (return_tx, mut return_rx) = mpsc::unbounded_channel::<Buffer>();
 
@@ -466,6 +479,8 @@ async fn in_task(
         }
 
         loop {
+            tracer.next();
+
             // Reuse a recycled buffer if available, otherwise allocate a new one.
             let buf = match return_rx.try_recv() {
                 Ok(buf) => buf,
@@ -485,8 +500,6 @@ async fn in_task(
 
             if let Err(err) = comp.status {
                 if err == TransferError::Stall {
-                    // Device halted the IN endpoint — clean half-close signal
-                    // meaning the device is done sending.
                     tracing::debug!("device halted IN endpoint (done sending)");
                 } else {
                     tracing::warn!("receiving failed: {err}");
@@ -495,8 +508,7 @@ async fn in_task(
                 break false;
             }
 
-            #[cfg(feature = "trace-packets")]
-            tracing::trace!("Received packet of {} bytes", comp.actual_len);
+            tracer.received_packet(comp.actual_len);
 
             let packet = RecvPacket {
                 buffer: Some(comp.buffer),
@@ -513,92 +525,100 @@ async fn in_task(
     half_close.lock().await.close_recv(host_initiated).await;
 }
 
+/// Task for performing USB OUT transfers.
 #[allow(clippy::too_many_arguments)]
 async fn out_task(
-    mut ep: Endpoint<Bulk, Out>, mut rx: mpsc::Receiver<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
-    max_packet_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
-    mut status_rx: watch::Receiver<DeviceStatus>,
+    mut ep: Endpoint<Bulk, Out>, mut rx: mpsc::Receiver<Bytes>, error: Arc<Mutex<Option<TaskError>>>, mps: usize,
+    half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>, mut status_rx: watch::Receiver<DeviceStatus>,
+    mut tracer: Tracer,
 ) {
     let mut total_bytes_sent: u64 = 0;
-    let host_initiated = 'task: {
-        loop {
-            let data = tokio::select! {
-                biased;
-                _ = status_rx.wait_for(|s| s.recv_closed || s.dead) => {
-                    tracing::debug!("device status change in out_task, stopping");
-                    break 'task false;
-                }
-                data = rx.recv() => data,
-            };
-            let Some(data) = data else {
-                // Drain all pending completions so data reaches the device
-                // before we signal close.
-                while ep.pending() > 0 {
-                    let comp = ep.next_complete().await;
-                    if let Err(err) = comp.status {
-                        if err == TransferError::Stall {
-                            tracing::debug!("device halted OUT endpoint during flush");
-                        } else {
-                            tracing::warn!("sending failed during flush: {err}");
-                            error.lock().unwrap().get_or_insert(err.into());
-                        }
-                        break 'task false;
-                    }
-                }
-                break 'task true;
-            };
 
-            let data_len = data.len();
-            total_bytes_sent = total_bytes_sent.wrapping_add(data_len as u64);
+    let mut host_initiated = 'task: loop {
+        tracer.next();
 
-            #[cfg(feature = "trace-packets")]
-            tracing::trace!("Queueing packet of {data_len} bytes for sending");
+        // Get data for sending from queue.
+        let data = tokio::select! {
+            biased;
 
-            ep.submit(Buffer::from(Vec::from(data)));
-
-            if data_len > 0 && data_len % max_packet_size == 0 {
-                ep.submit(Buffer::new(0));
+            _ = status_rx.wait_for(|s| s.recv_closed || s.dead) => {
+                tracing::debug!("device closed in out_task, stopping");
+                break 'task false;
             }
 
-            let mut get_complete = async || {
-                let pending = ep.pending();
-                if pending == 0 {
-                    None
-                } else if pending >= DMA_BUFFERS {
-                    Some(ep.next_complete().await)
+            data_opt = rx.recv() => {
+                match data_opt {
+                    Some(data) => data,
+                    None => break 'task true,
+                }
+            }
+        };
+
+        let data_len = data.len();
+        total_bytes_sent = total_bytes_sent.wrapping_add(data_len as u64);
+
+        // Send data via ons USB transfer.
+        tracer.sending_data(data_len);
+        tracer.send_part(data_len);
+        ep.submit(Buffer::from(Vec::from(data)));
+
+        // Terminate with zero length packet if length is multiple of MPS.
+        if data_len > 0 && data_len % mps == 0 {
+            tracer.send_terminator();
+            ep.submit(Buffer::new(0));
+        }
+        tracer.data_finished();
+
+        // Finish completed USB transfers.
+        let mut get_complete = async || {
+            let pending = ep.pending();
+            if pending == 0 {
+                None
+            } else if pending >= DMA_BUFFERS {
+                Some(ep.next_complete().await)
+            } else {
+                ep.next_complete().now_or_never()
+            }
+        };
+
+        while let Some(comp) = get_complete().await {
+            if let Err(err) = comp.status {
+                if err == TransferError::Stall {
+                    tracing::debug!("device halted OUT endpoint (done receiving)");
                 } else {
-                    ep.next_complete().now_or_never()
+                    tracing::warn!("sending failed: {err}");
+                    error.lock().unwrap().get_or_insert(err.into());
                 }
-            };
+                break 'task false;
+            }
 
-            while let Some(comp) = get_complete().await {
-                if let Err(err) = comp.status {
-                    if err == TransferError::Stall {
-                        // Device halted the OUT endpoint — clean half-close signal
-                        // meaning the device is done receiving.
-                        tracing::debug!("device halted OUT endpoint (done receiving)");
-                    } else {
-                        tracing::warn!("sending failed: {err}");
-                        error.lock().unwrap().get_or_insert(err.into());
-                    }
-                    break 'task false;
-                }
-
-                #[cfg(feature = "trace-packets")]
-                tracing::trace!("Sent packet of {} bytes", comp.actual_len);
-
-                if comp.actual_len != comp.buffer.len() {
-                    tracing::warn!("only {} out of {} bytes were sent", comp.actual_len, comp.buffer.len());
-                    *error.lock().unwrap() =
-                        Some(TaskError::PartialSend { size: comp.buffer.len(), sent: comp.actual_len });
-                }
+            if comp.actual_len != comp.buffer.len() {
+                tracing::warn!("only {} out of {} bytes were sent", comp.actual_len, comp.buffer.len());
+                *error.lock().unwrap() =
+                    Some(TaskError::PartialSend { size: comp.buffer.len(), sent: comp.actual_len });
             }
         }
     };
 
+    // Drain all pending completions so data reaches the device
+    // before we signal close.
+    while ep.pending() > 0 {
+        let comp = ep.next_complete().await;
+        if let Err(err) = comp.status {
+            if err == TransferError::Stall {
+                tracing::debug!("device halted OUT endpoint during flush");
+            } else {
+                tracing::warn!("sending failed during flush: {err}");
+                error.lock().unwrap().get_or_insert(err.into());
+            }
+            host_initiated = false;
+        }
+    }
+
     half_close.lock().await.close_send(host_initiated, total_bytes_sent).await;
 }
 
+/// Task for getting device status via USB CONTROL IN transfers.
 async fn status_task(
     iface: Interface, interface: u8, status_interval: Duration, status_tx: watch::Sender<DeviceStatus>,
     error: Arc<Mutex<Option<TaskError>>>,
@@ -630,6 +650,7 @@ async fn status_task(
                     }
                 }
             }
+
             Err(err) => {
                 tracing::warn!("status request failed: {err}");
                 error.lock().unwrap().get_or_insert(err.into());
@@ -644,17 +665,14 @@ async fn status_task(
 mod test {
     use super::*;
 
-    /// Verify that connect function is Send.
-    #[tokio::test]
-    async fn connect_is_send() {
-        let hnd = {
-            let Ok(mut devs) = nusb::list_devices().await else { return };
-            let Some(dev) = devs.next() else { return };
-            let Ok(hnd) = dev.open().await else { return };
-            hnd
-        };
-        tokio::spawn(async move {
-            let _ = connect(hnd, 0, &[]).await;
-        });
+    fn assert_send<T: Send>(_: &T) {}
+
+    #[test]
+    fn connect_is_send() {
+        fn check(dev: Device) {
+            let fut = connect(dev, 0, &[]);
+            assert_send(&fut);
+        }
+        _ = check;
     }
 }

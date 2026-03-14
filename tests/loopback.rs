@@ -13,8 +13,11 @@ mod util;
 use bytes::Bytes;
 use rand::{prelude::*, rngs::SmallRng};
 use serial_test::serial;
-use std::time::{Duration, Instant};
-use tokio::{sync::oneshot, time::sleep};
+use std::time::Duration;
+use tokio::{
+    sync::oneshot,
+    time::{sleep, Instant},
+};
 use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
 use util::*;
 use uuid::uuid;
@@ -22,6 +25,7 @@ use uuid::uuid;
 use upc::{
     device::{InterfaceId, UpcFunction},
     host::{connect, connect_with, find_interface, info, UpcOptions},
+    TRANSFER_PACKETS,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -31,10 +35,14 @@ const INFO: &[u8] = b"LOOPBACK TEST INFO";
 
 const HOST_SEED: u64 = 77701;
 const DEVICE_SEED: u64 = 88802;
-const TEST_PACKETS: usize = 200;
-const TEST_PACKET_MAX_SIZE: usize = 500_000;
+const TEST_PACKETS: usize = 2000;
+const TEST_PACKET_MAX_SIZE: usize = 1_500_000;
 
 const GUID: uuid::Uuid = uuid!("3bf77270-42d2-42c6-a475-490227a9cc89");
+
+// High-speed bulk max packet size.
+const MPS: usize = 512;
+const BIG: usize = MPS * TRANSFER_PACKETS;
 
 // ── Test-data helpers ────────────────────────────────────────────────────────
 
@@ -50,8 +58,40 @@ impl TestData {
             rng: SmallRng::seed_from_u64(seed),
             max_length,
             pre_lengths: [
-                0, 1, 2, 3, 511, 512, 513, 1023, 1024, 1025, 0, 2000, 2048, 0, 4096, 5000, 8191, 8192, 8193, 0,
+                0,
+                1,
+                2,
+                3,
+                511,
+                512,
+                513,
+                1023,
+                1024,
+                1025,
+                0,
+                2000,
+                2048,
+                0,
+                4096,
+                5000,
+                8191,
+                8192,
                 8193,
+                0,
+                8193,
+                // Around MPS * (TRANSFER_PACKETS - 1)
+                BIG - MPS - 1,
+                BIG - MPS,
+                BIG - MPS + 1,
+                // Around MPS * TRANSFER_PACKETS
+                BIG - 1,
+                BIG,
+                BIG + 1,
+                // Around MPS * (TRANSFER_PACKETS + 1)
+                BIG + MPS - 1,
+                BIG + MPS,
+                BIG + MPS + 1,
+                0,
             ]
             .into(),
         }
@@ -67,6 +107,7 @@ impl TestData {
         data
     }
 
+    #[track_caller]
     fn validate(&mut self, data: &[u8]) {
         let expected = self.generate();
         assert_eq!(data.len(), expected.len(), "data length mismatch");
@@ -109,6 +150,8 @@ async fn loopback() {
     // ------------------------------------------------------------------
     // 2. Spawn the device-side handler (accept + send/recv)
     // ------------------------------------------------------------------
+    let (dev_rx_done_tx, dev_rx_done_rx) = oneshot::channel::<(usize, f64)>();
+
     let device_task = tokio::spawn(async move {
         println!("[device] Waiting for connection…");
         let (dev_tx, mut dev_rx) = upc_fn.accept().await.expect("device accept failed");
@@ -116,6 +159,7 @@ async fn loopback() {
 
         // Receiver task on device side: receives what the host sent.
         let dev_recv_task = tokio::spawn(async move {
+            let rx_done_tx = dev_rx_done_tx;
             let mut rx_td = TestData::new(HOST_SEED, TEST_PACKET_MAX_SIZE);
 
             let start = Instant::now();
@@ -131,11 +175,11 @@ async fn loopback() {
                 rx_td.validate(&data);
             }
 
-            let elapsed = start.elapsed().as_secs_f32();
-            println!(
-                "[device-rx] Received {total} bytes in {elapsed:.2}s ({:.2} MB/s)",
-                total as f32 / elapsed / 1_048_576.
-            );
+            let elapsed = start.elapsed().as_secs_f64();
+            let mb_s = total as f64 / elapsed / 1_048_576.;
+            println!("[device-rx] Received {total} bytes in {elapsed:.2}s ({mb_s:.2} MB/s)");
+
+            let _ = rx_done_tx.send((total, elapsed));
 
             // Wait for sender to close.
             assert_eq!(dev_rx.recv().await.unwrap(), None, "device receiver not closed");
@@ -145,25 +189,15 @@ async fn loopback() {
         // Sender on device side: sends data for the host to receive.
         let mut tx_td = TestData::new(DEVICE_SEED, TEST_PACKET_MAX_SIZE);
 
-        let start = Instant::now();
-        let mut total = 0usize;
-
         println!("[device-tx] Sending…");
         for n in 0..TEST_PACKETS {
             let data = tx_td.generate();
             let len = data.len();
             dev_tx.send(Bytes::from(data)).await.expect("device send failed");
-            total += len;
             if n % 50 == 0 {
                 println!("[device-tx] packet {n}: {len} bytes");
             }
         }
-
-        let elapsed = start.elapsed().as_secs_f32();
-        println!(
-            "[device-tx] Sent {total} bytes in {elapsed:.2}s ({:.2} MB/s)",
-            total as f32 / elapsed / 1_048_576.
-        );
 
         // Wait a bit so the host can finish receiving, then wait for the
         // device receiver to confirm it got everything.
@@ -214,12 +248,15 @@ async fn loopback() {
     println!("[host] Connecting…");
     let (host_tx, mut host_rx) = connect(dev, iface_num, TOPIC).await.expect("host connect failed");
 
-    // Channel so we know the host receiver is done with all data packets
-    // before we drop the sender.
-    let (rx_done_tx, rx_done_rx) = oneshot::channel::<()>();
+    // Wall-clock start for the entire data transfer phase (after connection setup).
+    let transfer_start = Instant::now();
+
+    // Channel so we know the host receiver is done with all data packets.
+    let (host_rx_done_tx, host_rx_done_rx) = oneshot::channel::<(usize, f64)>();
 
     // Host receiver task: receives what the device sent.
     let host_recv_task = tokio::spawn(async move {
+        let rx_done_tx = host_rx_done_tx;
         let mut rx_td = TestData::new(DEVICE_SEED, TEST_PACKET_MAX_SIZE);
 
         let start = Instant::now();
@@ -235,13 +272,11 @@ async fn loopback() {
             rx_td.validate(&data);
         }
 
-        let elapsed = start.elapsed().as_secs_f32();
-        println!(
-            "[host-rx] Received {total} bytes in {elapsed:.2}s ({:.2} MB/s)",
-            total as f32 / elapsed / 1_048_576.
-        );
+        let elapsed = start.elapsed().as_secs_f64();
+        let mb_s = total as f64 / elapsed / 1_048_576.;
+        println!("[host-rx] Received {total} bytes in {elapsed:.2}s ({mb_s:.2} MB/s)");
 
-        rx_done_tx.send(()).unwrap();
+        rx_done_tx.send((total, elapsed)).unwrap();
 
         // Wait for receiver to close.
         assert_eq!(host_rx.recv().await.unwrap(), None, "host receiver not closed");
@@ -251,25 +286,23 @@ async fn loopback() {
     // Host sender: sends data for the device to receive.
     let mut tx_td = TestData::new(HOST_SEED, TEST_PACKET_MAX_SIZE);
 
-    let start = Instant::now();
-    let mut total = 0usize;
-
     println!("[host-tx] Sending…");
     for n in 0..TEST_PACKETS {
         let data = tx_td.generate();
         let len = data.len();
         host_tx.send(Bytes::from(data)).await.expect("host send failed");
-        total += len;
         if n % 50 == 0 {
             println!("[host-tx] packet {n}: {len} bytes");
         }
     }
 
-    let elapsed = start.elapsed().as_secs_f32();
-    println!("[host-tx] Sent {total} bytes in {elapsed:.2}s ({:.2} MB/s)", total as f32 / elapsed / 1_048_576.);
+    // Wait for both receivers to finish validating all packets and
+    // capture wall-clock time before cleanup sleeps inflate it.
+    let (host_rx_bytes, host_rx_elapsed) = host_rx_done_rx.await.unwrap();
+    let (dev_rx_bytes, dev_rx_elapsed) = dev_rx_done_rx.await.unwrap();
+    let total_elapsed = transfer_start.elapsed().as_secs_f64();
+    let total_bytes = host_rx_bytes + dev_rx_bytes;
 
-    // Wait for host receiver to finish validating all packets.
-    rx_done_rx.await.unwrap();
     sleep(Duration::from_secs(3)).await;
 
     println!("[host] Disconnecting…");
@@ -284,6 +317,16 @@ async fn loopback() {
     let (_reg, _upc_fn) = device_task.await.unwrap();
     // Keep `_reg` and `_upc_fn` alive until here so the gadget stays
     // registered and the device task can process the clean shutdown.
+
+    let host_rx_mb_s = host_rx_bytes as f64 / host_rx_elapsed / 1_048_576.;
+    let dev_rx_mb_s = dev_rx_bytes as f64 / dev_rx_elapsed / 1_048_576.;
+    let combined_mb_s = total_bytes as f64 / total_elapsed / 1_048_576.;
+
+    println!();
+    println!("device_to_host: {:.2} MB/s ({} bytes in {:.2} s)", host_rx_mb_s, host_rx_bytes, host_rx_elapsed);
+    println!("host_to_device: {:.2} MB/s ({} bytes in {:.2} s)", dev_rx_mb_s, dev_rx_bytes, dev_rx_elapsed);
+    println!("combined:       {:.2} MB/s ({} bytes in {:.2} s)", combined_mb_s, total_bytes, total_elapsed);
+    println!();
 
     sleep(Duration::from_secs(1)).await;
     println!("[loopback] ✅ Loopback test passed!");

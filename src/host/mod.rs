@@ -28,7 +28,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-use crate::channel_error;
+use crate::{channel_error, trace::Tracer};
 
 #[cfg(feature = "web")]
 mod guard;
@@ -127,11 +127,12 @@ pub struct UpcSender {
     tx: mpsc::Sender<Bytes>,
     shared: Arc<UpcShared>,
     max_size: usize,
+    tracer: Tracer,
 }
 
 impl fmt::Debug for UpcSender {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("UpcSender").field(&self.shared.name).finish()
+        f.debug_struct("UpcSender").field("name", &self.shared.name).field("max_size", &self.max_size).finish()
     }
 }
 
@@ -150,6 +151,9 @@ impl UpcSender {
                 format!("packet size {} exceeds maximum of {}", data.len(), self.max_size),
             ));
         }
+
+        self.tracer.enqueued(data.len());
+
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
             Err(_) => Err(self
@@ -221,11 +225,12 @@ pub struct UpcReceiver {
     buffer: BytesMut,
     max_size: usize,
     max_transfer_size: usize,
+    tracer: Tracer,
 }
 
 impl fmt::Debug for UpcReceiver {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("UpcReceiver").field(&self.shared.name).finish()
+        f.debug_struct("UpcReceiver").field("name", &self.shared.name).field("max_size", &self.max_size).finish()
     }
 }
 
@@ -236,6 +241,9 @@ impl UpcReceiver {
     /// If canceled, no data will have been removed from the receive queue.
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
         loop {
+            self.tracer.next();
+
+            // Wait for a received transfer.
             let Some(first) = self.rx.recv().await else {
                 // Channel closed — check if there was an error or a clean half-close.
                 return match self.shared.error.lock().unwrap().clone() {
@@ -244,14 +252,19 @@ impl UpcReceiver {
                 };
             };
 
-            // Drain already-queued transfers to batch the copy.
+            let mut short = first.data().len() < self.max_transfer_size;
+            self.tracer.deque_transfer(first.data().len(), short);
+
+            // Drain already queued transfers to batch the copy.
             let mut batch = Vec::with_capacity(1 + self.rx.len());
             batch.push(first);
-            let mut short = batch[0].data().len() < self.max_transfer_size;
             if !short {
                 while let Ok(p) = self.rx.try_recv() {
                     short = p.data().len() < self.max_transfer_size;
+                    self.tracer.deque_transfer(p.data().len(), short);
+
                     batch.push(p);
+
                     if short {
                         break;
                     }
@@ -279,6 +292,7 @@ impl UpcReceiver {
             }
 
             if short {
+                self.tracer.dequeued(self.buffer.len());
                 return Ok(Some(take(&mut self.buffer).into()));
             }
         }

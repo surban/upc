@@ -7,14 +7,17 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, oneshot::error::TryRecvError, watch};
+use tokio::sync::{mpsc, watch};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 use webusb_web::{OpenUsbDevice, UsbControlRequest, UsbDevice, UsbDirection, UsbRecipient, UsbRequestType};
 
 use super::{guard::InUseGuard, DeviceStatus, UpcOptions, UpcReceiver, UpcSender};
-use crate::{ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE};
+use crate::{
+    ctrl_req, status, trace::Tracer, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE, QUEUE_LEN,
+    TRANSFER_PACKETS,
+};
 
 /// A received packet from the web host backend.
 pub(crate) struct RecvPacket(Bytes);
@@ -33,7 +36,16 @@ impl RecvPacket {
     }
 }
 
-pub(crate) fn to_io_err(error: webusb_web::Error) -> Error {
+pub(crate) fn to_io_err(error: TaskError) -> Error {
+    match error {
+        TaskError::WebUsb(err) => web_to_io_err(err),
+        TaskError::PartialSend { size, sent } => {
+            Error::new(ErrorKind::WriteZero, format!("only sent {sent} out of {size} bytes"))
+        }
+    }
+}
+
+fn web_to_io_err(error: webusb_web::Error) -> Error {
     let kind = match error.kind() {
         webusb_web::ErrorKind::Unsupported => ErrorKind::Unsupported,
         webusb_web::ErrorKind::AlreadyOpen => ErrorKind::ResourceBusy,
@@ -46,8 +58,19 @@ pub(crate) fn to_io_err(error: webusb_web::Error) -> Error {
         webusb_web::ErrorKind::Other => ErrorKind::Other,
         _ => ErrorKind::Other,
     };
-
     Error::new(kind, error)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TaskError {
+    WebUsb(webusb_web::Error),
+    PartialSend { size: usize, sent: usize },
+}
+
+impl From<webusb_web::Error> for TaskError {
+    fn from(err: webusb_web::Error) -> Self {
+        Self::WebUsb(err)
+    }
 }
 
 /// Sleep for the specified duration.
@@ -92,7 +115,7 @@ pub fn find_interface(dev: &UsbDevice, class: Class) -> Result<u8> {
 /// The maximum size of the data is [`INFO_SIZE`].
 pub async fn info(hnd: &OpenUsbDevice, interface: u8) -> Result<Vec<u8>> {
     // Claim interface.
-    hnd.claim_interface(interface).await.map_err(to_io_err)?;
+    hnd.claim_interface(interface).await.map_err(web_to_io_err)?;
 
     // Read info.
     tracing::debug!("reading info");
@@ -103,7 +126,7 @@ pub async fn info(hnd: &OpenUsbDevice, interface: u8) -> Result<Vec<u8>> {
         0,
         interface.into(),
     );
-    let info = hnd.control_transfer_in(&req, INFO_SIZE as _).await.map_err(to_io_err)?;
+    let info = hnd.control_transfer_in(&req, INFO_SIZE as _).await.map_err(web_to_io_err)?;
 
     Ok(info)
 }
@@ -113,7 +136,7 @@ pub async fn info(hnd: &OpenUsbDevice, interface: u8) -> Result<Vec<u8>> {
 /// Returns `true` if the device responds with the expected probe response,
 /// `false` if the request is stalled or the response does not match.
 pub async fn probe(hnd: &OpenUsbDevice, interface: u8) -> Result<bool> {
-    hnd.claim_interface(interface).await.map_err(to_io_err)?;
+    hnd.claim_interface(interface).await.map_err(web_to_io_err)?;
 
     tracing::debug!("probing interface {interface}");
     let req = UsbControlRequest::new(
@@ -127,7 +150,7 @@ pub async fn probe(hnd: &OpenUsbDevice, interface: u8) -> Result<bool> {
     match hnd.control_transfer_in(&req, ctrl_req::PROBE_RESPONSE.len() as _).await {
         Ok(data) => Ok(data.as_slice() == ctrl_req::PROBE_RESPONSE),
         Err(err) if err.kind() == webusb_web::ErrorKind::Stall => Ok(false),
-        Err(err) => Err(to_io_err(err)),
+        Err(err) => Err(web_to_io_err(err)),
     }
 }
 
@@ -200,23 +223,28 @@ impl HalfCloseHandle {
         }
     }
 
+    /// Close connection if sender and receiver are closed.
     async fn close_if_both(&mut self) {
         if self.send_closed && self.recv_closed {
-            close(&self.hnd, self.iface).await;
+            tracing::debug!("closing connection");
+            let control = UsbControlRequest::new(
+                UsbRequestType::Vendor,
+                UsbRecipient::Interface,
+                ctrl_req::CLOSE,
+                0,
+                self.iface.into(),
+            );
+            if let Err(err) = self.hnd.control_transfer_out(&control, &[]).await {
+                tracing::warn!("closing connection failed: {err}");
+            }
         }
     }
 }
 
+/// Data shared between sender and receiver.
 pub(crate) struct UpcShared {
     pub(crate) name: String,
-    pub(crate) error: Arc<Mutex<Option<webusb_web::Error>>>,
-    pub(crate) stop_tx: Option<oneshot::Sender<()>>,
-}
-
-impl Drop for UpcShared {
-    fn drop(&mut self) {
-        let _ = self.stop_tx.take().unwrap().send(());
-    }
+    pub(crate) error: Arc<Mutex<Option<TaskError>>>,
 }
 
 /// Connect to the specified device and interface.
@@ -263,7 +291,7 @@ pub async fn connect_with(
     // Get endpoints.
     let mut ep_in = None;
     let mut ep_out = None;
-    let mut max_packet_size = usize::MAX;
+    let mut mps = usize::MAX;
     {
         let Some(cfg) = dev.configuration() else {
             return Err(Error::new(ErrorKind::NotFound, "USB device has no active configuration"));
@@ -276,11 +304,11 @@ pub async fn connect_with(
             use webusb_web::UsbEndpointType;
             match (ep.direction, ep.endpoint_type) {
                 (UsbDirection::In, UsbEndpointType::Bulk) => {
-                    max_packet_size = max_packet_size.min(ep.packet_size as _);
+                    mps = mps.min(ep.packet_size as _);
                     ep_in = Some(ep.endpoint_number);
                 }
                 (UsbDirection::Out, UsbEndpointType::Bulk) => {
-                    max_packet_size = max_packet_size.min(ep.packet_size as _);
+                    mps = mps.min(ep.packet_size as _);
                     ep_out = Some(ep.endpoint_number);
                 }
                 _ => {}
@@ -290,12 +318,12 @@ pub async fn connect_with(
     let (Some(ep_in), Some(ep_out)) = (ep_in, ep_out) else {
         return Err(Error::new(ErrorKind::NotFound, "endpoints not found"));
     };
-    let max_transfer_size = max_packet_size * 128;
+    let max_transfer_size = mps * TRANSFER_PACKETS;
 
     // Open device and claim interface.
-    hnd.claim_interface(interface).await.map_err(to_io_err)?;
-    hnd.clear_halt(UsbDirection::In, ep_in).await.map_err(to_io_err)?;
-    hnd.clear_halt(UsbDirection::Out, ep_out).await.map_err(to_io_err)?;
+    hnd.claim_interface(interface).await.map_err(web_to_io_err)?;
+    hnd.clear_halt(UsbDirection::In, ep_in).await.map_err(web_to_io_err)?;
+    hnd.clear_halt(UsbDirection::Out, ep_out).await.map_err(web_to_io_err)?;
 
     // Close previous connection.
     tracing::debug!("Closing previous connection");
@@ -306,7 +334,7 @@ pub async fn connect_with(
         0,
         interface.into(),
     );
-    hnd.control_transfer_out(&control, &[]).await.map_err(to_io_err)?;
+    hnd.control_transfer_out(&control, &[]).await.map_err(web_to_io_err)?;
 
     // Query capabilities.
     tracing::debug!("querying capabilities");
@@ -328,7 +356,7 @@ pub async fn connect_with(
 
     // Send host capabilities.
     tracing::debug!("sending host capabilities");
-    let host_caps = HostCapabilities { max_packet_size: options.max_size as u64 };
+    let host_caps = HostCapabilities { max_size: options.max_size as u64 };
     let host_caps_req = UsbControlRequest::new(
         UsbRequestType::Vendor,
         UsbRecipient::Interface,
@@ -377,24 +405,25 @@ pub async fn connect_with(
 
     let hnd_in = hnd.clone();
     let error_in = error.clone();
-    let (tx_in, mut rx_in) = mpsc::channel(16);
+    let (tx_in, mut rx_in) = mpsc::channel(QUEUE_LEN);
     let in_guard = guard.clone();
     let half_close_in = half_close.clone();
     let status_rx_in = status_rx.clone();
+    let in_tracer = Tracer::host_in(&name);
     spawn_local(async move {
         let _in_guard = in_guard;
-        in_task(hnd_in, tx_in, ep_in, error_in, max_transfer_size, half_close_in, status_rx_in).await;
+        in_task(hnd_in, tx_in, ep_in, error_in, max_transfer_size, half_close_in, status_rx_in, in_tracer).await;
     });
 
     let hnd_out = hnd.clone();
-    let (tx_out, rx_out) = mpsc::channel(16);
+    let (tx_out, rx_out) = mpsc::channel(QUEUE_LEN);
     let error_out = error.clone();
-    let (stop_tx, stop_rx) = oneshot::channel();
     let half_close_out = half_close.clone();
     let out_guard = guard.clone();
+    let out_tracer = Tracer::host_out(&name);
     spawn_local(async move {
         let _out_guard = out_guard;
-        out_task(hnd_out, rx_out, ep_out, error_out, stop_rx, max_packet_size, half_close_out, status_rx).await;
+        out_task(hnd_out, rx_out, ep_out, error_out, mps, half_close_out, status_rx, out_tracer).await;
     });
 
     // Flush receive buffer.
@@ -415,51 +444,64 @@ pub async fn connect_with(
         0,
         interface.into(),
     );
-    hnd.control_transfer_out(&control, &options.topic).await.map_err(to_io_err)?;
+    hnd.control_transfer_out(&control, &options.topic).await.map_err(web_to_io_err)?;
     tracing::debug!("connection is open");
 
     // Build objects.
-    let device_max_size = usize::try_from(caps.max_packet_size).unwrap_or(usize::MAX);
-    let shared = Arc::new(UpcShared { name, error, stop_tx: Some(stop_tx) });
-    let sender = UpcSender { tx: tx_out, shared: shared.clone(), max_size: device_max_size };
-    let recv =
-        UpcReceiver { rx: rx_in, shared, buffer: BytesMut::new(), max_size: options.max_size, max_transfer_size };
+    let device_max_size = usize::try_from(caps.max_size).unwrap_or(usize::MAX);
+    let send_tracer = Tracer::host_enqueue(&name);
+    let recv_tracer = Tracer::host_dequeue(&name);
+    let shared = Arc::new(UpcShared { name, error });
+    let sender = UpcSender { tx: tx_out, shared: shared.clone(), max_size: device_max_size, tracer: send_tracer };
+    let recv = UpcReceiver {
+        rx: rx_in,
+        shared,
+        buffer: BytesMut::new(),
+        max_size: options.max_size,
+        max_transfer_size,
+        tracer: recv_tracer,
+    };
 
     Ok((sender, recv))
 }
 
+/// Task for performing USB IN transfers.
 async fn in_task(
-    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<RecvPacket>, ep: u8, error: Arc<Mutex<Option<webusb_web::Error>>>,
+    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<RecvPacket>, ep: u8, error: Arc<Mutex<Option<TaskError>>>,
     max_transfer_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
-    mut status_rx: watch::Receiver<DeviceStatus>,
+    mut status_rx: watch::Receiver<DeviceStatus>, mut tracer: Tracer,
 ) {
     let host_initiated = loop {
+        tracer.next();
+
+        // Receive USB transfer.
         let res = tokio::select! {
             biased;
+
             () = tx.closed() => break true,
+
             _ = status_rx.wait_for(|s| s.dead) => {
                 tracing::debug!("device dead (ping timeout), stopping in_task");
                 break false;
             }
+
             res = hnd.transfer_in(ep, max_transfer_size as _) => res,
         };
 
         match res {
             Ok(buf) => {
-                #[cfg(feature = "trace-packets")]
-                tracing::trace!("Received packet of {} bytes", buf.len());
+                tracer.received_packet(buf.len());
                 if tx.send(RecvPacket(Bytes::from(buf))).await.is_err() {
                     break true;
                 }
             }
             Err(err) if err.kind() == webusb_web::ErrorKind::Stall => {
-                // Device halted the IN endpoint — clean half-close signal.
                 tracing::debug!("device halted IN endpoint (done sending)");
                 break false;
             }
             Err(err) => {
                 tracing::warn!("receiving failed: {err}");
-                error.lock().unwrap().get_or_insert(err);
+                error.lock().unwrap().get_or_insert(err.into());
                 break false;
             }
         }
@@ -468,79 +510,85 @@ async fn in_task(
     half_close.lock().await.close_recv(host_initiated).await;
 }
 
+/// Task for performing USB OUT transfers.
 #[allow(clippy::too_many_arguments)]
 async fn out_task(
-    hnd: Rc<OpenUsbDevice>, mut rx: mpsc::Receiver<Bytes>, ep: u8, error: Arc<Mutex<Option<webusb_web::Error>>>,
-    mut stop_rx: oneshot::Receiver<()>, max_packet_size: usize,
-    half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>, mut status_rx: watch::Receiver<DeviceStatus>,
+    hnd: Rc<OpenUsbDevice>, mut rx: mpsc::Receiver<Bytes>, ep: u8, error: Arc<Mutex<Option<TaskError>>>,
+    mps: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
+    mut status_rx: watch::Receiver<DeviceStatus>, mut tracer: Tracer,
 ) {
     let mut total_bytes_sent: u64 = 0;
-    let host_initiated = 'outer: {
-        loop {
-            let data = tokio::select! {
-                biased;
-                data = rx.recv() => data,
-                _ = status_rx.wait_for(|s| s.recv_closed || s.dead) => {
-                    tracing::debug!("device status change in out_task, stopping");
-                    break 'outer false;
+
+    let host_initiated = 'task: loop {
+        tracer.next();
+
+        // Get data to send from queue.
+        let data = tokio::select! {
+            biased;
+
+            _ = status_rx.wait_for(|s| s.recv_closed || s.dead) => {
+                tracing::debug!("device status change in out_task, stopping");
+                break 'task false;
+            }
+
+            data_opt = rx.recv() => {
+                match data_opt {
+                    Some(data) => data,
+                    None => break 'task true,
                 }
-            };
-            let Some(mut data) = data else { break 'outer true };
+            }
+        };
 
-            total_bytes_sent = total_bytes_sent.wrapping_add(data.len() as u64);
+        total_bytes_sent = total_bytes_sent.wrapping_add(data.len() as u64);
 
-            loop {
-                match stop_rx.try_recv() {
-                    Err(TryRecvError::Empty) => (),
-                    _ => break 'outer false,
+        // Send data via one USB transfer.
+        tracer.sending_data(data.len());
+        tracer.send_part(data.len());
+        match hnd.transfer_out(ep, &data).await {
+            Ok(sent) if sent as usize == data.len() => (),
+            Ok(sent) => {
+                tracing::warn!("only {sent} out of {} bytes were sent", data.len());
+                *error.lock().unwrap() = Some(TaskError::PartialSend { size: data.len(), sent: sent as _ });
+                break 'task false;
+            }
+            Err(err) if err.kind() == webusb_web::ErrorKind::Stall => {
+                tracing::debug!("device halted OUT endpoint (done receiving)");
+                break 'task false;
+            }
+            Err(err) => {
+                tracing::warn!("sending failed: {err}");
+                error.lock().unwrap().get_or_insert(err.into());
+                break 'task false;
+            }
+        }
+
+        // Send zero length packet if length is a multiple of MPS.
+        if !data.is_empty() && data.len() % mps == 0 {
+            tracer.send_terminator();
+            match hnd.transfer_out(ep, &[]).await {
+                Ok(_) => {}
+                Err(err) if err.kind() == webusb_web::ErrorKind::Stall => {
+                    tracing::debug!("device halted OUT endpoint during ZLP (done receiving)");
+                    break 'task false;
                 }
-
-                match hnd.transfer_out(ep, &data).await {
-                    Ok(n) if n as usize != data.len() => {
-                        #[cfg(feature = "trace-packets")]
-                        tracing::trace!("Sent packet of {n} bytes");
-                        let _ = data.split_to(n as usize);
-                    }
-                    Ok(_) => {
-                        #[cfg(feature = "trace-packets")]
-                        tracing::trace!("Sent packet of {} bytes", data.len());
-                        if data.is_empty() || data.len() % max_packet_size != 0 {
-                            break;
-                        } else {
-                            // Send zero length packet to indicate end of transfer.
-                            data = Bytes::new();
-                        }
-                    }
-                    Err(err) if err.kind() == webusb_web::ErrorKind::Stall => {
-                        // Device halted the OUT endpoint — clean half-close signal.
-                        tracing::debug!("device halted OUT endpoint (done receiving)");
-                        break 'outer false;
-                    }
-                    Err(err) => {
-                        tracing::warn!("sending failed: {err}");
-                        error.lock().unwrap().get_or_insert(err);
-                        break 'outer false;
-                    }
+                Err(err) => {
+                    tracing::warn!("sending ZLP failed: {err}");
+                    error.lock().unwrap().get_or_insert(err.into());
+                    break 'task false;
                 }
             }
         }
+
+        tracer.data_finished();
     };
 
     half_close.lock().await.close_send(host_initiated, total_bytes_sent).await;
 }
 
-async fn close(hnd: &OpenUsbDevice, iface: u8) {
-    tracing::debug!("closing connection");
-    let control =
-        UsbControlRequest::new(UsbRequestType::Vendor, UsbRecipient::Interface, ctrl_req::CLOSE, 0, iface.into());
-    if let Err(err) = hnd.control_transfer_out(&control, &[]).await {
-        tracing::warn!("closing connection failed: {err}");
-    }
-}
-
+/// Task for getting device status via USB CONTROL IN transfers.
 async fn status_task(
     hnd: Rc<OpenUsbDevice>, interface: u8, status_interval: Duration, status_tx: watch::Sender<DeviceStatus>,
-    error: Arc<Mutex<Option<webusb_web::Error>>>,
+    error: Arc<Mutex<Option<TaskError>>>,
 ) {
     loop {
         tokio::select! {
@@ -572,7 +620,7 @@ async fn status_task(
             }
             Err(err) => {
                 tracing::warn!("status request failed: {err}");
-                error.lock().unwrap().get_or_insert(err);
+                error.lock().unwrap().get_or_insert(err.into());
                 status_tx.send_modify(|status| status.dead = true);
                 return;
             }

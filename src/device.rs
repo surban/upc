@@ -20,8 +20,10 @@ use std::{
 use tokio::{
     sync::{mpsc, watch, Mutex},
     task::JoinSet,
-    time::Instant,
+    time::{sleep, Instant},
 };
+use uuid::Uuid;
+
 use usb_gadget::function::{
     custom::{
         Custom, CustomBuilder, Endpoint, EndpointDirection, EndpointReceiver, EndpointSender, Event, Interface,
@@ -29,17 +31,17 @@ use usb_gadget::function::{
     },
     Handle,
 };
-use uuid::Uuid;
 
-use crate::{channel_error, ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE, MAX_SIZE};
-
-const QUEUE_DEPTH: usize = 32;
+use crate::{
+    channel_error, ctrl_req, status, trace::Tracer, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE,
+    MAX_SIZE, QUEUE_LEN, TRANSFER_PACKETS,
+};
 
 #[derive(Debug, Clone)]
 struct Cfg {
     info: Vec<u8>,
     ping_timeout: Option<Duration>,
-    max_packet_size: u64,
+    max_size: u64,
     recv_pool_size: usize,
 }
 
@@ -48,7 +50,7 @@ impl Default for Cfg {
         Self {
             info: Vec::new(),
             ping_timeout: Some(Duration::from_secs(10)),
-            max_packet_size: MAX_SIZE as u64,
+            max_size: MAX_SIZE as u64,
             recv_pool_size: 5 * 1024 * 1024,
         }
     }
@@ -59,11 +61,12 @@ pub struct UpcSender {
     tx: mpsc::Sender<Bytes>,
     error: watch::Receiver<Option<ErrorKind>>,
     max_size: usize,
+    tracer: Tracer,
 }
 
 impl fmt::Debug for UpcSender {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("UpcSender").finish()
+        f.debug_struct("UpcSender").field("max_size", &self.max_size).finish()
     }
 }
 
@@ -82,6 +85,9 @@ impl UpcSender {
                 format!("packet size {} exceeds maximum of {}", data.len(), self.max_size),
             ));
         }
+
+        self.tracer.enqueued(data.len());
+
         match self.tx.send(data).await {
             Ok(()) => Ok(()),
             Err(_) => Err(channel_error((*self.error.borrow()).unwrap_or(ErrorKind::BrokenPipe))),
@@ -147,11 +153,15 @@ pub struct UpcReceiver {
     max_size: usize,
     max_transfer_size: usize,
     error: watch::Receiver<Option<ErrorKind>>,
+    tracer: Tracer,
 }
 
 impl fmt::Debug for UpcReceiver {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("UpcReceiver").field("topic", &self.topic).finish()
+        f.debug_struct("UpcReceiver")
+            .field("topic", &String::from_utf8_lossy(&self.topic))
+            .field("max_size", &self.max_size)
+            .finish()
     }
 }
 
@@ -166,6 +176,9 @@ impl UpcReceiver {
     /// ## Cancel safety
     /// If canceled, no data will have been removed from the receive queue.
     pub async fn recv(&mut self) -> Result<Option<BytesMut>> {
+        self.tracer.next();
+        self.tracer.dequeing();
+
         loop {
             let Some(packet) = self.rx.recv().await else {
                 // Channel closed — check if there was an error or a clean half-close.
@@ -176,6 +189,8 @@ impl UpcReceiver {
             };
 
             let packet_len = packet.len();
+            self.tracer.dequeued_part(packet_len);
+
             self.buffer.unsplit(packet);
 
             if self.buffer.len() > self.max_size {
@@ -187,6 +202,7 @@ impl UpcReceiver {
             }
 
             if packet_len < self.max_transfer_size {
+                self.tracer.dequeued(self.buffer.len());
                 return Ok(Some(take(&mut self.buffer)));
             }
         }
@@ -239,12 +255,12 @@ struct BytesPool {
 
 impl BytesPool {
     /// Create a new pool of specified size.
-    fn new(pool_size: usize) -> Self {
+    pub fn new(pool_size: usize) -> Self {
         Self { buf: BytesMut::with_capacity(pool_size), pool_size }
     }
 
     /// Take one chunk from the pool, reallocating if exhausted.
-    fn chunk(&mut self, chunk_size: usize) -> BytesMut {
+    pub fn chunk(&mut self, chunk_size: usize) -> BytesMut {
         if self.buf.capacity() < chunk_size {
             self.buf = BytesMut::with_capacity(self.pool_size.max(chunk_size));
         }
@@ -260,19 +276,25 @@ struct Head {
 }
 
 fn connection(
-    topic: Vec<u8>, max_transfer_size: usize, max_send_size: usize, max_recv_packet_size: usize,
+    topic: Vec<u8>, max_transfer_size: usize, max_send_size: usize, max_recv_size: usize,
 ) -> (UpcSender, UpcReceiver, Head) {
-    let (tx_in, rx_in) = mpsc::channel(QUEUE_DEPTH);
-    let (tx_out, rx_out) = mpsc::channel(QUEUE_DEPTH);
+    let (tx_in, rx_in) = mpsc::channel(QUEUE_LEN);
+    let (tx_out, rx_out) = mpsc::channel(QUEUE_LEN);
     let (error_tx, error_rx) = watch::channel(None);
-    let sender = UpcSender { tx: tx_out, error: error_rx.clone(), max_size: max_send_size };
+    let sender = UpcSender {
+        tx: tx_out,
+        error: error_rx.clone(),
+        max_size: max_send_size,
+        tracer: Tracer::device_enqueue(),
+    };
     let recv = UpcReceiver {
         topic,
         rx: rx_in,
         buffer: BytesMut::new(),
-        max_size: max_recv_packet_size,
+        max_size: max_recv_size,
         max_transfer_size,
         error: error_rx,
+        tracer: Tracer::device_dequeue(),
     };
     let head = Head { tx: tx_in, rx: rx_out, error: error_tx };
     (sender, recv, head)
@@ -412,14 +434,14 @@ impl UpcFunction {
 
     /// Returns the maximum receive packet size.
     pub async fn max_size(&self) -> u64 {
-        self.cfg.lock().await.max_packet_size
+        self.cfg.lock().await.max_size
     }
 
     /// Sets the maximum receive packet size accepted.
     ///
     /// The default is [`MAX_SIZE`].
     pub async fn set_max_size(&self, max_size: u64) {
-        self.cfg.lock().await.max_packet_size = max_size;
+        self.cfg.lock().await.max_size = max_size;
     }
 
     /// Returns the receive pool size in bytes.
@@ -455,76 +477,109 @@ impl UpcFunction {
         }
     }
 
+    /// Prepare USB IN transfers
+    async fn prepare_in(ep_rx: &Mutex<EndpointReceiver>, max_transfer_size: usize, pool: &mut BytesPool) {
+        let mut ep_rx = ep_rx.lock().await;
+        while ep_rx.try_recv(pool.chunk(max_transfer_size)).is_ok() {}
+    }
+
+    /// Task that performs USB IN transfers.
+    ///
     /// Returns `true` if the host initiated the close (CLOSE_SEND with byte count reached),
     /// `false` if the device-side receiver was dropped.
     async fn in_task(
         ep_rx: &Mutex<EndpointReceiver>, tx: mpsc::Sender<BytesMut>, mut close_rx: watch::Receiver<Option<u64>>,
-        pool_size: usize,
+        max_transfer_size: usize, mut pool: BytesPool,
     ) -> Result<bool> {
+        let mut tracer = Tracer::device_in();
+
         let mut ep_rx = ep_rx.lock().await;
-        let max_packet_size = ep_rx.max_packet_size()?;
-        let tx2 = tx.clone();
         let mut total_received: u64 = 0;
-        let mut pool = BytesPool::new(pool_size);
+        let tx2 = tx.clone();
 
         loop {
             // Check if we have already received all bytes the host sent.
-            if let Some(expected) = *close_rx.borrow() {
-                if total_received == expected {
-                    tracing::debug!(
-                        "received all {total_received} bytes from host (expected {expected}), closing"
-                    );
-                    return Ok(true);
-                }
+            if Some(total_received) == *close_rx.borrow() {
+                tracing::debug!("received all {total_received} bytes from host");
+                return Ok(true);
             }
 
-            let Ok(permit) = tx.reserve().await else { break };
+            // Reserve space in receive queue.
+            let permit = tokio::select! {
+                biased;
+
+                res = tx.reserve() => {
+                    match res {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    }
+                },
+
+                Ok(()) = close_rx.changed() => continue,
+            };
 
             // Select between receiving USB data, detecting that the
             // UpcReceiver has been dropped (so we can send the CLOSE_RECV
             // notification promptly even when the host is idle), and
             // the host signaling CLOSE_SEND with a byte count.
-            let chunk = pool.chunk(max_packet_size);
             tokio::select! {
                 biased;
-                res = ep_rx.recv_async(chunk) => {
+
+                res = ep_rx.recv_async(pool.chunk(max_transfer_size)) => {
                     if let Some(data) = res? {
                         total_received = total_received.wrapping_add(data.len() as u64);
-                        #[cfg(feature = "trace-packets")]
-                        tracing::trace!("Received packet of {} bytes (total: {total_received})", data.len());
+
+                        tracer.next();
+                        tracer.received_data(data.len());
+
                         permit.send(data);
                     }
                 }
+
                 () = tx2.closed() => break,
-                res = close_rx.changed() => {
-                    // CLOSE_SEND received with byte count — loop back to check the count.
-                    if res.is_err() {
-                        break;
-                    }
-                }
+
+                Ok(()) = close_rx.changed() => continue,
             }
         }
 
         Ok(false)
     }
 
-    async fn out_task(ep_tx: &Mutex<EndpointSender>, mut rx: mpsc::Receiver<Bytes>) -> Result<()> {
+    /// Task that performs USB OUT transfers.
+    async fn out_task(
+        ep_tx: &Mutex<EndpointSender>, mut rx: mpsc::Receiver<Bytes>, max_transfer_size: usize,
+    ) -> Result<()> {
+        let mut tracer = Tracer::device_out();
+
         let mut ep_tx = ep_tx.lock().await;
-        let max_packet_size = ep_tx.max_packet_size()?;
+        let mps = ep_tx.max_packet_size()?;
 
         while let Some(mut data) = rx.recv().await {
-            loop {
-                let part = data.split_to(data.len().min(max_packet_size));
-                let part_len = part.len();
+            tracer.next();
+
+            let data_len = data.len();
+            tracer.sending_data(data_len);
+
+            // Limit maximum USB transfer size to avoid issues with some UDCs.
+            while !data.is_empty() {
+                let part = data.split_to(data.len().min(max_transfer_size));
+
+                tracer.send_part(part.len());
                 ep_tx.send_async(part).await?;
-
-                #[cfg(feature = "trace-packets")]
-                tracing::trace!("Sent packet of {part_len} bytes");
-
-                if part_len != max_packet_size {
-                    break;
-                }
             }
+
+            // If data length align with transfer size of endpoint, we need to insert a
+            // zero length packet to indicate that packet is finished.
+            if data_len % mps == 0 {
+                // WORKAROUND: dummy_hcd driver needs a flush before a ZLP,
+                //             otherwise it may deliver partial packets.
+                ep_tx.flush_async().await?;
+
+                tracer.send_terminator();
+                ep_tx.send_async(Bytes::new()).await?;
+            }
+
+            tracer.data_finished();
         }
 
         // Flush the send queue so all enqueued data reaches the host
@@ -552,7 +607,8 @@ impl UpcFunction {
             }
         });
 
-        let mut max_packet_size = None;
+        // USB endpoint maximum packet size.
+        let mut mps = None;
 
         let ep_tx = Mutex::new(ep_tx);
         let ep_rx = Mutex::new(ep_rx);
@@ -563,20 +619,16 @@ impl UpcFunction {
 
         let mut send_open = false;
         let mut recv_open = false;
-        let mut last_status = Instant::now();
+        let mut last_status;
         let mut conn_error = watch::channel(None).0;
         let mut host_caps = HostCapabilities::default();
+        let mut ping_timeout = DeviceCapabilities::default().ping_timeout;
+        let mut timeout_sleep = pin!(sleep(Duration::MAX));
 
         loop {
-            let timeout_task = async {
-                let ping_timeout = cfg.lock().await.ping_timeout;
-                match ping_timeout {
-                    Some(d) => tokio::time::sleep_until(last_status + d).await,
-                    None => future::pending().await,
-                }
-            };
-
             tokio::select! {
+                biased;
+
                 () = &mut unbound => {
                     tracing::debug!("device unbound");
                     break;
@@ -592,9 +644,8 @@ impl UpcFunction {
 
                     match ep0.event()? {
                         Event::Enable => {
-                            tracing::debug!("device enabled");
-                            max_packet_size = Some(ep_tx.lock().await.max_packet_size()?);
-                            tracing::debug!("maximum packet size is {} bytes", max_packet_size.unwrap());
+                            mps = Some(ep_tx.lock().await.max_packet_size()?);
+                            tracing::debug!(mps =% mps.unwrap(), "device enabled");
                             host_caps = HostCapabilities::default();
                         }
 
@@ -606,7 +657,7 @@ impl UpcFunction {
                             ep_rx.lock().await.cancel()?;
                             send_open = false;
                             recv_open = false;
-                            max_packet_size = None;
+                            mps = None;
                         }
 
                         Event::SetupHostToDevice(req) => {
@@ -616,12 +667,15 @@ impl UpcFunction {
                                 ctrl_req::OPEN => {
                                     tracing::debug!("open connection request");
 
+                                    // Close any previous connection.
                                     if send_open || recv_open {
                                         tracing::debug!("closing previous connection");
                                         in_task = future::pending().boxed();
                                         out_task = future::pending().boxed();
                                         ep_tx.lock().await.cancel()?;
                                         ep_rx.lock().await.cancel()?;
+                                        send_open = false;
+                                        recv_open = false;
                                         host_caps = HostCapabilities::default();
                                     }
 
@@ -629,29 +683,36 @@ impl UpcFunction {
                                     let _ = ep_tx.lock().await.control()?.clear_halt();
                                     let _ = ep_rx.lock().await.control()?.clear_halt();
 
-                                    // WORKAROUND: some UDCs fail the first incoming transfer when no
-                                    //             receive buffers are enqueued.
-                                    while ep_rx.lock().await.try_recv(BytesMut::with_capacity(max_packet_size.unwrap())).is_ok() {}
+                                    // Determine limits.
+                                    let max_transfer_size = mps.expect("request without enable") * TRANSFER_PACKETS;
+                                    let max_send_size = usize::try_from(host_caps.max_size).unwrap_or(usize::MAX);
+                                    let max_recv_size = usize::try_from(cfg.lock().await.max_size).unwrap_or(usize::MAX);
 
+                                    // Prepare IN transfers. They must be enqueued before host starts sending.
+                                    let mut pool = BytesPool::new(cfg.lock().await.recv_pool_size);
+                                    Self::prepare_in(&ep_rx, max_transfer_size, &mut pool).await;
+
+                                    // Accept request from host and start tasks.
                                     match req.recv_all() {
                                         Ok(topic) => {
-                                            let max_send_size = usize::try_from(host_caps.max_packet_size).unwrap_or(usize::MAX);
-                                            let max_recv_packet_size = usize::try_from(cfg.lock().await.max_packet_size).unwrap_or(usize::MAX);
-                                            let (ctx, crx, Head { tx, rx, error }) = connection(topic, max_packet_size.unwrap(), max_send_size, max_recv_packet_size);
+                                            let (ctx, crx, Head { tx, rx, error }) =
+                                                connection(topic, max_transfer_size, max_send_size, max_recv_size);
                                             let _ = conn_tx.send((ctx, crx)).await;
                                             let (close_tx, close_rx) = watch::channel(None);
-                                            let recv_pool_size = cfg.lock().await.recv_pool_size;
-                                            in_task = Self::in_task(&ep_rx, tx, close_rx, recv_pool_size).boxed();
-                                            out_task = Self::out_task(&ep_tx, rx).boxed();
+                                            in_task = Self::in_task(&ep_rx, tx, close_rx, max_transfer_size, pool).boxed();
+                                            out_task = Self::out_task(&ep_tx, rx, max_transfer_size).boxed();
                                             in_close_tx = close_tx;
                                             send_open = true;
                                             recv_open = true;
                                             last_status = Instant::now();
+                                            if let Some(d) = ping_timeout {
+                                                timeout_sleep.as_mut().reset(last_status + d);
+                                            }
                                             conn_error = error;
                                             tracing::debug!("connection established");
                                         }
                                         Err(err) => {
-                                            tracing::warn!("topic receive error: {err}");
+                                            tracing::warn!("open request receive error: {err}");
                                             ep_rx.lock().await.cancel()?;
                                         }
                                     }
@@ -736,10 +797,11 @@ impl UpcFunction {
                                 ctrl_req::CAPABILITIES => {
                                     tracing::debug!("sending capabilities");
                                     let cfg = cfg.lock().await;
+                                    ping_timeout = cfg.ping_timeout;
                                     let caps = DeviceCapabilities {
-                                        ping_timeout: cfg.ping_timeout,
+                                        ping_timeout,
                                         status_supported: true,
-                                        max_packet_size: cfg.max_packet_size,
+                                        max_size: cfg.max_size,
                                     };
                                     if let Err(err) = req.send(&caps.encode()) {
                                         tracing::warn!("capabilities send error: {err}");
@@ -748,6 +810,9 @@ impl UpcFunction {
 
                                 ctrl_req::STATUS => {
                                     last_status = Instant::now();
+                                    if let Some(d) = ping_timeout {
+                                        timeout_sleep.as_mut().reset(last_status + d);
+                                    }
                                     let mut buf = [0u8; status::MAX_SIZE];
                                     let mut len = 0;
                                     if !recv_open {
@@ -768,7 +833,7 @@ impl UpcFunction {
                     }
                 }
 
-                () = timeout_task, if send_open || recv_open => {
+                () = &mut timeout_sleep, if ping_timeout.is_some() && (send_open || recv_open) => {
                     tracing::warn!("host ping timeout, closing connection");
                     let _ = conn_error.send(Some(ErrorKind::TimedOut));
                     in_task = future::pending().boxed();
@@ -777,7 +842,6 @@ impl UpcFunction {
                     ep_rx.lock().await.cancel()?;
                     send_open = false;
                     recv_open = false;
-                    last_status = Instant::now();
                 }
 
                 res = &mut in_task => {
@@ -815,7 +879,6 @@ impl UpcFunction {
                     let _ = ep_tx.lock().await.control()?.halt();
                     tracing::debug!("IN endpoint halted (device done sending)");
                 }
-
             }
         }
 

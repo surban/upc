@@ -14,11 +14,24 @@ pub mod device;
 #[cfg(any(feature = "host", feature = "web"))]
 pub mod host;
 
+mod trace;
+
 /// Maximum info size.
 pub const INFO_SIZE: usize = 4096;
 
 /// Default maximum packet size.
 pub const MAX_SIZE: usize = 16_777_216;
+
+/// Maximum USB packets per transfer.
+///
+/// This limits the number of USB packets per IN and OUT transfer.
+/// Setting this too high will cause issues with UDCs like dwc2;
+/// it sometimes corrupts transfers if it has to split them up.
+#[doc(hidden)]
+pub const TRANSFER_PACKETS: usize = 128;
+
+/// Length of send and receive queues.
+const QUEUE_LEN: usize = 32;
 
 /// USB interface class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -134,14 +147,14 @@ pub(crate) struct DeviceCapabilities {
     pub ping_timeout: Option<Duration>,
     /// Whether the device supports the STATUS control request.
     pub status_supported: bool,
-    /// Maximum receive packet size.
-    pub max_packet_size: u64,
+    /// Maximum receive size.
+    pub max_size: u64,
 }
 
 #[cfg(any(feature = "host", feature = "device", feature = "web"))]
 impl Default for DeviceCapabilities {
     fn default() -> Self {
-        Self { ping_timeout: None, status_supported: false, max_packet_size: MAX_SIZE as u64 }
+        Self { ping_timeout: None, status_supported: false, max_size: MAX_SIZE as u64 }
     }
 }
 
@@ -170,8 +183,8 @@ impl DeviceCapabilities {
         // Tag 0x02: status_supported as u8 (0 = false, 1 = true).
         tlv::encode(&mut buf, Self::TAG_STATUS_SUPPORTED, &[u8::from(self.status_supported)]);
 
-        // Tag 0x03: max_packet_size as u64.
-        tlv::encode(&mut buf, Self::TAG_MAX_PACKET_SIZE, &self.max_packet_size.to_le_bytes());
+        // Tag 0x03: max_size as u64.
+        tlv::encode(&mut buf, Self::TAG_MAX_PACKET_SIZE, &self.max_size.to_le_bytes());
 
         buf
     }
@@ -203,7 +216,7 @@ impl DeviceCapabilities {
                         let size = u64::from_le_bytes([
                             value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
                         ]);
-                        caps.max_packet_size = size;
+                        caps.max_size = size;
                     }
                 }
 
@@ -222,14 +235,14 @@ impl DeviceCapabilities {
 #[cfg(any(feature = "host", feature = "device", feature = "web"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostCapabilities {
-    /// Maximum receive packet size.
-    pub max_packet_size: u64,
+    /// Maximum receive size.
+    pub max_size: u64,
 }
 
 #[cfg(any(feature = "host", feature = "device", feature = "web"))]
 impl Default for HostCapabilities {
     fn default() -> Self {
-        Self { max_packet_size: MAX_SIZE as u64 }
+        Self { max_size: MAX_SIZE as u64 }
     }
 }
 
@@ -247,7 +260,7 @@ impl HostCapabilities {
     #[cfg(any(feature = "host", feature = "web"))]
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        tlv::encode(&mut buf, Self::TAG_MAX_PACKET_SIZE, &self.max_packet_size.to_le_bytes());
+        tlv::encode(&mut buf, Self::TAG_MAX_PACKET_SIZE, &self.max_size.to_le_bytes());
         buf
     }
 
@@ -264,7 +277,7 @@ impl HostCapabilities {
                         let size = u64::from_le_bytes([
                             value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
                         ]);
-                        caps.max_packet_size = size;
+                        caps.max_size = size;
                     }
                 }
                 _ => { /* unknown tag — skip for forward compatibility */ }

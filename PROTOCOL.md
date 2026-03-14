@@ -204,31 +204,47 @@ See section 4 for the TLV encoding and capability definitions.
 
 UPC uses **USB short-packet framing** to delimit application-level
 messages on the bulk endpoints. There is no length header — message
-boundaries are determined entirely by USB transfer sizes.
+boundaries are determined entirely by the USB short-packet mechanism.
 
 ### Background
 
-USB bulk transfers have a maximum packet size determined by the endpoint
-descriptor (typically 512 bytes for USB 2.0 High Speed, 1024 bytes for
-USB 3.x SuperSpeed). A USB transfer that is smaller than the maximum
-packet size is called a **short packet** and signals the end of a
-logical transfer to the host controller.
+USB bulk endpoints have a **maximum packet size (MPS)** determined by
+the endpoint descriptor (typically 512 bytes for USB 2.0 High Speed,
+1024 bytes for USB 3.x SuperSpeed). At the USB wire level, data is
+transmitted in packets of up to MPS bytes. A packet shorter than MPS
+(including a zero-length packet) is called a **short packet** and
+signals the end of a transfer.
+
+Application code typically interacts with USB through **transfers**,
+where a single transfer may span many USB packets. The USB controller
+handles packetization transparently:
+
+* **OUT (send):** the controller splits the transfer data into
+  MPS-sized USB packets automatically.
+* **IN (receive):** the controller accumulates incoming USB packets into
+  the transfer buffer until a short packet arrives or the buffer is
+  full.
 
 ### Sending
 
 To send an application packet of N bytes:
 
-1. Split the data into chunks of at most `max_packet_size` bytes
-   (the endpoint's maximum packet size from the descriptor).
-2. Send each chunk as a USB bulk transfer.
-3. **If** the last chunk is exactly `max_packet_size` bytes (i.e. the
-   total application packet size is a non-zero multiple of
-   `max_packet_size`), send an additional **zero-length packet (ZLP)**
-   to signal the end of the message.
-4. **If** the last chunk is shorter than `max_packet_size`, the short
-   packet naturally signals the end of the message. The sender **must
-   not** send a ZLP in this case — doing so would be interpreted as a
-   separate, empty application packet.
+1. Submit the data as one or more USB OUT transfers. The USB controller
+   splits each transfer into MPS-sized USB packets automatically.
+   If the data is split across multiple transfers, **all transfers
+   except the last must have a size that is a positive multiple of
+   MPS**. Otherwise the USB controller would emit a short packet at
+   the end of an intermediate transfer, which the receiver would
+   incorrectly interpret as end-of-message.
+2. **If** N is a non-zero multiple of MPS, send an additional
+   **zero-length packet (ZLP)** as a separate transfer to signal the
+   end of the message. Without the ZLP, the last USB packet on the wire
+   is full-sized and the receiver cannot distinguish end-of-message from
+   more data to follow.
+3. **If** N is not a multiple of MPS, the last USB packet on the wire is
+   naturally shorter than MPS. This short packet signals end-of-message
+   and the sender **must not** send a ZLP — doing so would be
+   interpreted as a separate, empty application packet.
 
 **Empty application packets** (0 bytes) are sent as a single ZLP.
 
@@ -236,35 +252,53 @@ To send an application packet of N bytes:
 
 To receive an application packet:
 
-1. Submit bulk IN transfers of `max_packet_size` bytes.
-2. Accumulate received data into a buffer.
-3. When a transfer completes with fewer bytes than `max_packet_size`
-   (including a ZLP with 0 bytes), the message is complete — return
-   the accumulated buffer as one application packet.
-4. When a transfer completes with exactly `max_packet_size` bytes,
-   continue accumulating — the message is not yet complete.
+1. Submit USB IN transfers with a buffer size that is a **positive
+   multiple of MPS**. The larger the buffer, the fewer transfer
+   completions are needed, improving throughput. The minimum buffer
+   size is MPS.
+2. Accumulate received data from completed transfers.
+3. When a transfer completes with **fewer bytes than the buffer size**
+   (including a ZLP completing with 0 bytes), the USB controller
+   received a short packet — the message is complete. Return the
+   accumulated data as one application packet.
+4. When a transfer completes with **exactly the buffer size**, the
+   buffer was filled without a short packet arriving — the message
+   may not yet be complete. Submit another transfer and continue
+   accumulating.
 
-If the accumulated buffer exceeds the negotiated maximum application
+If the accumulated data exceeds the negotiated maximum application
 packet size, the receiver **should** discard the data and report an
 error.
 
-### Example
+### Implementation Note
 
-Sending a 1025-byte application packet with `max_packet_size = 512`:
+The reference implementation uses a receive buffer size of
+MPS × 128 bytes. This balances throughput against memory usage and
+avoids issues with certain USB device controllers that corrupt
+overly large transfers. Implementations are free to choose any
+buffer size that is a positive multiple of MPS.
 
-| Transfer | Size    | Type         |
-|----------|---------|--------------|
-| 1        | 512     | full packet  |
-| 2        | 512     | full packet  |
-| 3        | 1       | short packet (end of message) |
+### Examples
 
-Sending a 1024-byte application packet with `max_packet_size = 512`:
+Sending a 1025-byte application packet with MPS = 512:
 
-| Transfer | Size    | Type         |
-|----------|---------|--------------|
-| 1        | 512     | full packet  |
-| 2        | 512     | full packet  |
-| 3        | 0       | ZLP (end of message) |
+| USB Packet | Size | Type                          |
+|------------|------|-------------------------------|
+| 1          | 512  | full packet                   |
+| 2          | 512  | full packet                   |
+| 3          | 1    | short packet (end of message) |
+
+No ZLP is needed because the last packet is short.
+
+Sending a 1024-byte application packet with MPS = 512:
+
+| USB Packet | Size | Type                          |
+|------------|------|-------------------------------|
+| 1          | 512  | full packet                   |
+| 2          | 512  | full packet                   |
+| 3          | 0    | ZLP (end of message)          |
+
+A ZLP is required because 1024 is a multiple of 512.
 
 4\. Capabilities
 ----------------
@@ -295,7 +329,7 @@ Sent by the device in response to a CAPABILITIES IN request.
 |--------|-------------------|-----------------------|--------------|-------------|
 | `0x01` | ping_timeout      | u32 LE (milliseconds) | 0 (disabled) | If non-zero, the device expects STATUS requests within this interval. If no STATUS request arrives in time, the device considers the host dead and closes the connection. 0 disables the timeout. Default: 10,000 ms (10 seconds) when supported. |
 | `0x02` | status_supported  | u8 (0 or 1)          | 0 (false)    | Whether the device handles STATUS requests. The host must not send STATUS if this is 0. |
-| `0x03` | max_packet_size   | u64 LE                | 16,777,216   | Maximum application-level packet size the device can receive (in bytes). Default: 16 MiB. |
+| `0x03` | max_size          | u64 LE                | 16,777,216   | Maximum application-level packet size the device can receive (in bytes). Default: 16 MiB. |
 
 ### Host Capabilities
 
@@ -303,10 +337,10 @@ Sent by the host via a CAPABILITIES OUT request.
 
 | Tag    | Name              | Value Format          | Default      | Description |
 |--------|-------------------|-----------------------|--------------|-------------|
-| `0x03` | max_packet_size   | u64 LE                | 16,777,216   | Maximum application-level packet size the host can receive (in bytes). Default: 16 MiB. |
+| `0x03` | max_size          | u64 LE                | 16,777,216   | Maximum application-level packet size the host can receive (in bytes). Default: 16 MiB. |
 
-The effective maximum packet size for each direction is the minimum of
-the sender's local limit and the receiver's advertised `max_packet_size`.
+The effective maximum size for each direction is the minimum of
+the sender's local limit and the receiver's advertised `max_size`.
 
 5\. Status Polling and Liveness
 -------------------------------
@@ -466,7 +500,7 @@ Everything else is optional and can be added incrementally:
 
 * Add **PROBE** (0x00) for auto-discovery support.
 * Add **INFO** (0x03) to provide a device description string.
-* Add **CAPABILITIES** (0x07) to negotiate max packet sizes.
+* Add **CAPABILITIES** (0x07) to negotiate max sizes.
 * Add **STATUS** (0x06) for liveness detection.
 * Add **CLOSE_SEND** / **CLOSE_RECV** (0x04, 0x05) for half-close.
 * Add **Microsoft OS descriptors** for driverless Windows support.

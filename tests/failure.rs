@@ -133,8 +133,10 @@ fn device_hung() {
         Ok(Some(data)) => panic!("unexpected data from hung device: {data:?}"),
     }
 
-    // Wait for the out_task to also detect the dead status.
-    host_rt.block_on(async { tokio::time::sleep(Duration::from_secs(1)).await });
+    // Wait for the out_task to also detect the dead status and drop the channel.
+    // This can take up to TIMEOUT (1s) because close_if_both() sends CTRL_REQ_CLOSE
+    // which blocks until the hung device times out.
+    host_rt.block_on(host_tx.closed());
 
     // Host send should also fail.
     println!("[host] Trying to send…");
