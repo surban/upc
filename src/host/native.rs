@@ -26,7 +26,7 @@ use crate::{ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_
 const TIMEOUT: Duration = Duration::from_secs(1);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const DMA_BUFFERS: usize = 16;
+const DMA_BUFFERS: usize = 8;
 const CHANNEL_CAPACITY: usize = 64;
 const TRANSFER_PACKETS: usize = 512;
 
