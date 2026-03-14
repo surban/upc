@@ -60,3 +60,7 @@ jobs:
       - name: Run CLI pipe tests
         run: .misc/cargo-test-runner.sh .misc/test-cli-pipe.sh ./target/release/upc
         timeout-minutes: 5
+
+      - name: Run example tests
+        run: .misc/cargo-test-runner.sh .misc/test-examples.sh ./target/release
+        timeout-minutes: 5
