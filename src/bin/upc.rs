@@ -367,7 +367,7 @@ impl DeviceFilter {
 #[command(version, about)]
 struct Cli {
     /// Print connection events to stderr.
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     verbose: bool,
 
     #[command(subcommand)]
@@ -400,15 +400,11 @@ enum Command {
 struct ListCmd {
     #[command(flatten)]
     filter: DeviceFilter,
-
-    /// Show all USB devices, not just matched UPC interfaces.
-    #[arg(long)]
-    all: bool,
 }
 
 #[cfg(feature = "host")]
 impl ListCmd {
-    async fn exec(&self) -> ExitCode {
+    async fn exec(&self, verbose: bool) -> ExitCode {
         use upc::host::info;
 
         let devices: Vec<_> = match nusb::list_devices().await {
@@ -436,11 +432,11 @@ impl ListCmd {
                 }
             }
 
-            if !self.all && upc_ifaces.is_empty() {
+            if !verbose && upc_ifaces.is_empty() {
                 continue;
             }
 
-            if self.all {
+            if verbose {
                 println!(
                     "Device {:04x}:{:04x} on {}:{:03} - {} {}{}",
                     dev_info.vendor_id(),
@@ -499,7 +495,7 @@ impl ListCmd {
 
                 found = true;
 
-                if self.all {
+                if verbose {
                     println!("    UPC info: {info_str}");
                 } else {
                     println!(
@@ -521,8 +517,8 @@ impl ListCmd {
             }
         }
 
-        if !found && self.all {
-            println!("No UPC interfaces found.");
+        if !found && !verbose {
+            eprintln!("No UPC interfaces found.");
         }
 
         ExitCode::SUCCESS
@@ -553,10 +549,6 @@ struct ScanCmd {
     /// Filter by USB device address.
     #[arg(long)]
     address: Option<u8>,
-
-    /// Show all USB devices and interfaces, not just discovered UPC channels.
-    #[arg(long)]
-    all: bool,
 }
 
 #[cfg(feature = "host")]
@@ -590,7 +582,7 @@ impl ScanCmd {
         true
     }
 
-    async fn exec(&self) -> ExitCode {
+    async fn exec(&self, verbose: bool) -> ExitCode {
         use upc::host::{info, probe};
 
         let devices: Vec<_> = match nusb::list_devices().await {
@@ -614,11 +606,11 @@ impl ScanCmd {
                 .map(|iface| iface.interface_number())
                 .collect();
 
-            if !self.all && vendor_ifaces.is_empty() {
+            if !verbose && vendor_ifaces.is_empty() {
                 continue;
             }
 
-            if self.all {
+            if verbose {
                 println!(
                     "Device {:04x}:{:04x} on {}:{:03} - {} {}{}",
                     dev_info.vendor_id(),
@@ -671,7 +663,7 @@ impl ScanCmd {
                                 String::new()
                             }
                         };
-                        if self.all {
+                        if verbose {
                             println!("    UPC interface {iface_num}: {info_str}");
                         } else {
                             println!(
@@ -688,12 +680,12 @@ impl ScanCmd {
                         }
                     }
                     Ok(false) => {
-                        if self.all {
+                        if verbose {
                             println!("    Interface {iface_num}: not UPC");
                         }
                     }
                     Err(err) => {
-                        if self.all {
+                        if verbose {
                             println!("    Interface {iface_num}: probe failed ({err})");
                         } else {
                             tracing::debug!(
@@ -707,7 +699,7 @@ impl ScanCmd {
             }
         }
 
-        if !found && !self.all {
+        if !found && !verbose {
             eprintln!("No UPC interfaces found.");
         }
 
@@ -1123,9 +1115,9 @@ async fn main() -> ExitCode {
 
     match cli.command {
         #[cfg(feature = "host")]
-        Command::Scan(cmd) => cmd.exec().await,
+        Command::Scan(cmd) => cmd.exec(cli.verbose).await,
         #[cfg(feature = "host")]
-        Command::List(cmd) => cmd.exec().await,
+        Command::List(cmd) => cmd.exec(cli.verbose).await,
         #[cfg(feature = "host")]
         Command::Connect(cmd) => cmd.exec(cli.verbose).await,
         #[cfg(feature = "device")]

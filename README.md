@@ -10,6 +10,8 @@ It uses a vendor-specific USB interface with bulk endpoints and works with any
 USB device controller (UDC) on the device side and any operating system on the
 host side, including web browsers via [WebUSB].
 
+On the wire, UPC uses a single vendor-specific USB interface with two bulk
+endpoints for data and control transfers for connection management.
 Unlike standard USB classes (CDC-ACM, HID, etc.) that require
 OS drivers or are limited to specific use cases, UPC operates as a
 vendor-specific interface — your application gets exclusive, direct access
@@ -129,7 +131,8 @@ Requirements
 
 The minimum supported Rust version (MSRV) is 1.85.
 
-The native host-side part supports any operating system supported by [nusb].
+The native host-side part supports Linux, macOS and Windows via [nusb].
+The WebUSB host-side part works in browsers with WebUSB support (Chrome, Edge).
 
 The device-side part requires Linux and a USB device controller (UDC).
 
@@ -175,12 +178,12 @@ This probes every vendor-specific USB interface and outputs one tab-separated
 line per discovered UPC channel:
 
 ```text
-1209:0001	001:005	my-device	0	01	sensor v1
+1209:0001       003:020         0       00
 ```
 
 The columns are: VID:PID, bus:address, serial, interface, subclass, info.
 
-Use `--all` for a human-readable listing of all USB devices.
+Use `-v` for a human-readable listing of all USB devices and their interfaces.
 
 Connect to a UPC device and forward stdin/stdout:
 
