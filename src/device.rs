@@ -33,6 +33,8 @@ use uuid::Uuid;
 
 use crate::{channel_error, ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE, MAX_SIZE};
 
+const QUEUE_DEPTH: usize = 32;
+
 #[derive(Debug, Clone)]
 struct Cfg {
     info: Vec<u8>,
@@ -260,8 +262,8 @@ struct Head {
 fn connection(
     topic: Vec<u8>, max_transfer_size: usize, max_send_size: usize, max_recv_packet_size: usize,
 ) -> (UpcSender, UpcReceiver, Head) {
-    let (tx_in, rx_in) = mpsc::channel(32);
-    let (tx_out, rx_out) = mpsc::channel(32);
+    let (tx_in, rx_in) = mpsc::channel(QUEUE_DEPTH);
+    let (tx_out, rx_out) = mpsc::channel(QUEUE_DEPTH);
     let (error_tx, error_rx) = watch::channel(None);
     let sender = UpcSender { tx: tx_out, error: error_rx.clone(), max_size: max_send_size };
     let recv = UpcReceiver {
@@ -515,8 +517,10 @@ impl UpcFunction {
                 let part = data.split_to(data.len().min(max_packet_size));
                 let part_len = part.len();
                 ep_tx.send_async(part).await?;
+
                 #[cfg(feature = "trace-packets")]
                 tracing::trace!("Sent packet of {part_len} bytes");
+
                 if part_len != max_packet_size {
                     break;
                 }

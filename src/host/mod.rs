@@ -216,7 +216,7 @@ impl Sink<Bytes> for UpcSink {
 
 /// Receives data from a USB packet channel.
 pub struct UpcReceiver {
-    rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::Receiver<RecvPacket>,
     shared: Arc<UpcShared>,
     buffer: BytesMut,
     max_size: usize,
@@ -236,7 +236,7 @@ impl UpcReceiver {
     /// If canceled, no data will have been removed from the receive queue.
     pub async fn recv(&mut self) -> Result<Option<Bytes>> {
         loop {
-            let Some(packet) = self.rx.recv().await else {
+            let Some(first) = self.rx.recv().await else {
                 // Channel closed — check if there was an error or a clean half-close.
                 return match self.shared.error.lock().unwrap().clone() {
                     Some(err) => Err(to_io_err(err)),
@@ -244,15 +244,41 @@ impl UpcReceiver {
                 };
             };
 
-            let packet_len = packet.len();
-            self.buffer.unsplit(packet.into());
+            // Drain already-queued transfers to batch the copy.
+            let mut batch = Vec::with_capacity(1 + self.rx.len());
+            batch.push(first);
+            let mut short = batch[0].data().len() < self.max_transfer_size;
+            if !short {
+                while let Ok(p) = self.rx.try_recv() {
+                    short = p.data().len() < self.max_transfer_size;
+                    batch.push(p);
+                    if short {
+                        break;
+                    }
+                }
+            }
+
+            // If the buffer is empty and the first packet is not a zero-copy
+            // DMA buffer, directly adopt its allocation instead of copying.
+            if self.buffer.is_empty() && !batch[0].is_zero_copy() {
+                let packet = batch.remove(0);
+                self.buffer = BytesMut::from(Bytes::from(packet.into_vec()));
+            }
+
+            // Single reserve for the entire batch.
+            let total: usize = batch.iter().map(|p| p.data().len()).sum();
+            self.buffer.reserve(total);
+
+            for packet in batch {
+                self.buffer.extend_from_slice(packet.data());
+            }
 
             if self.buffer.len() > self.max_size {
                 self.buffer.clear();
                 return Err(Error::new(ErrorKind::OutOfMemory, "maximum packet size exceeded"));
             }
 
-            if packet_len < self.max_transfer_size {
+            if short {
                 return Ok(Some(take(&mut self.buffer).into()));
             }
         }

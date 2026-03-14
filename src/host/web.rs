@@ -16,6 +16,23 @@ use webusb_web::{OpenUsbDevice, UsbControlRequest, UsbDevice, UsbDirection, UsbR
 use super::{guard::InUseGuard, DeviceStatus, UpcOptions, UpcReceiver, UpcSender};
 use crate::{ctrl_req, status, Class, DeviceCapabilities, HostCapabilities, INFO_SIZE};
 
+/// A received packet from the web host backend.
+pub(crate) struct RecvPacket(Bytes);
+
+impl RecvPacket {
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn is_zero_copy(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.0.into()
+    }
+}
+
 pub(crate) fn to_io_err(error: webusb_web::Error) -> Error {
     let kind = match error.kind() {
         webusb_web::ErrorKind::Unsupported => ErrorKind::Unsupported,
@@ -412,7 +429,7 @@ pub async fn connect_with(
 }
 
 async fn in_task(
-    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<Bytes>, ep: u8, error: Arc<Mutex<Option<webusb_web::Error>>>,
+    hnd: Rc<OpenUsbDevice>, tx: mpsc::Sender<RecvPacket>, ep: u8, error: Arc<Mutex<Option<webusb_web::Error>>>,
     max_transfer_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
     mut status_rx: watch::Receiver<DeviceStatus>,
 ) {
@@ -431,7 +448,7 @@ async fn in_task(
             Ok(buf) => {
                 #[cfg(feature = "trace-packets")]
                 tracing::trace!("Received packet of {} bytes", buf.len());
-                if tx.send(Bytes::from(buf)).await.is_err() {
+                if tx.send(RecvPacket(Bytes::from(buf))).await.is_err() {
                     break true;
                 }
             }

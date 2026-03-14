@@ -28,6 +28,37 @@ const CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const BUFFER_COUNT: usize = 16;
 
+/// A received DMA buffer that is returned to the in_task for reuse on drop.
+pub(crate) struct RecvPacket {
+    buffer: Option<Buffer>,
+    actual_len: usize,
+    return_tx: mpsc::UnboundedSender<Buffer>,
+}
+
+impl RecvPacket {
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.buffer.as_ref().unwrap()[..self.actual_len]
+    }
+
+    pub(crate) fn is_zero_copy(&self) -> bool {
+        self.buffer.as_ref().unwrap().is_zero_copy()
+    }
+
+    pub(crate) fn into_vec(mut self) -> Vec<u8> {
+        let mut v = self.buffer.take().unwrap().into_vec();
+        v.truncate(self.actual_len);
+        v
+    }
+}
+
+impl Drop for RecvPacket {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buffer.take() {
+            let _ = self.return_tx.send(buf);
+        }
+    }
+}
+
 const fn control_in(request: u8, value: u16, index: u16, length: u16) -> ControlIn {
     ControlIn {
         control_type: ControlType::Vendor,
@@ -420,18 +451,26 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
 }
 
 async fn in_task(
-    mut ep: Endpoint<Bulk, In>, tx: mpsc::Sender<Bytes>, error: Arc<Mutex<Option<TaskError>>>,
+    mut ep: Endpoint<Bulk, In>, tx: mpsc::Sender<RecvPacket>, error: Arc<Mutex<Option<TaskError>>>,
     max_transfer_size: usize, half_close: Arc<tokio::sync::Mutex<HalfCloseHandle>>,
     mut status_rx: watch::Receiver<DeviceStatus>,
 ) {
+    let (return_tx, mut return_rx) = mpsc::unbounded_channel::<Buffer>();
+
     let host_initiated = {
-        // Pre-submit buffers.
+        // Pre-submit DMA buffers.
         for _ in 0..BUFFER_COUNT {
-            ep.submit(Buffer::new(max_transfer_size));
+            ep.submit(ep.allocate(max_transfer_size));
         }
 
         loop {
-            ep.submit(Buffer::new(max_transfer_size));
+            // Reuse a recycled buffer if available, otherwise allocate a new one.
+            let buf = match return_rx.try_recv() {
+                Ok(buf) => buf,
+                Err(_) => ep.allocate(max_transfer_size),
+            };
+            ep.submit(buf);
+
             let comp = tokio::select! {
                 biased;
                 comp = ep.next_complete() => comp,
@@ -454,13 +493,16 @@ async fn in_task(
                 break false;
             }
 
-            let mut buf = comp.buffer.into_vec();
-            buf.truncate(comp.actual_len);
-
             #[cfg(feature = "trace-packets")]
-            tracing::trace!("Received packet of {} bytes", buf.len());
+            tracing::trace!("Received packet of {} bytes", comp.actual_len);
 
-            if tx.send(buf.into()).await.is_err() {
+            let packet = RecvPacket {
+                buffer: Some(comp.buffer),
+                actual_len: comp.actual_len,
+                return_tx: return_tx.clone(),
+            };
+
+            if tx.send(packet).await.is_err() {
                 break true;
             }
         }
@@ -504,14 +546,15 @@ async fn out_task(
                 break 'task true;
             };
 
-            total_bytes_sent = total_bytes_sent.wrapping_add(data.len() as u64);
+            let data_len = data.len();
+            total_bytes_sent = total_bytes_sent.wrapping_add(data_len as u64);
 
             #[cfg(feature = "trace-packets")]
-            tracing::trace!("Queueing packet of {} bytes for sending", data.len());
+            tracing::trace!("Queueing packet of {data_len} bytes for sending");
 
-            ep.submit(Buffer::from(data.to_vec()));
+            ep.submit(Buffer::from(Vec::from(data)));
 
-            if !data.is_empty() && data.len() % max_packet_size == 0 {
+            if data_len > 0 && data_len % max_packet_size == 0 {
                 ep.submit(Buffer::new(0));
             }
 
