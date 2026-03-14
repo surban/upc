@@ -111,7 +111,8 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-See the [examples](examples/) directory and [API documentation](https://docs.rs/upc) for more details.
+See the [examples](examples/) directory, [API documentation](https://docs.rs/upc),
+and [protocol specification](PROTOCOL.md) for more details.
 
 Features
 --------
