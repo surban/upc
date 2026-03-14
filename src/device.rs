@@ -662,6 +662,13 @@ impl UpcFunction {
                             let ctrl_req = req.ctrl_req();
                             tracing::debug!("outgoing control request: {ctrl_req:?}");
                             match ctrl_req.request {
+                                ctrl_req::PROBE => {
+                                    tracing::debug!("sending probe response");
+                                    if let Err(err) = req.send(ctrl_req::PROBE_RESPONSE) {
+                                        tracing::warn!("probe send error: {err}");
+                                    }
+                                }
+
                                 ctrl_req::INFO => {
                                     tracing::debug!("sending info");
                                     if let Err(err) = req.send(&cfg.lock().await.info) {

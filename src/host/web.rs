@@ -91,6 +91,29 @@ pub async fn info(hnd: &OpenUsbDevice, interface: u8) -> Result<Vec<u8>> {
     Ok(info)
 }
 
+/// Probe whether the specified interface speaks the UPC protocol.
+///
+/// Returns `true` if the device responds with the expected probe response,
+/// `false` if the request is stalled or the response does not match.
+pub async fn probe(hnd: &OpenUsbDevice, interface: u8) -> Result<bool> {
+    hnd.claim_interface(interface).await.map_err(to_io_err)?;
+
+    tracing::debug!("probing interface {interface}");
+    let req = UsbControlRequest::new(
+        UsbRequestType::Vendor,
+        UsbRecipient::Interface,
+        ctrl_req::PROBE,
+        0,
+        interface.into(),
+    );
+
+    match hnd.control_transfer_in(&req, ctrl_req::PROBE_RESPONSE.len() as _).await {
+        Ok(data) => Ok(data.as_slice() == ctrl_req::PROBE_RESPONSE),
+        Err(err) if err.kind() == webusb_web::ErrorKind::Stall => Ok(false),
+        Err(err) => Err(to_io_err(err)),
+    }
+}
+
 /// Tracks half-close state and sends control requests when each direction closes.
 struct HalfCloseHandle {
     hnd: Rc<OpenUsbDevice>,

@@ -141,6 +141,28 @@ pub async fn info(dev: &Device, interface: u8) -> Result<Vec<u8>> {
     Ok(info)
 }
 
+/// Probe whether the specified interface speaks the UPC protocol.
+///
+/// Returns `true` if the device responds with the expected probe response,
+/// `false` if the request is stalled or the response does not match.
+pub async fn probe(dev: &Device, interface: u8) -> Result<bool> {
+    let iface = dev.claim_interface(interface).await.map_err(nusb_to_io_err)?;
+
+    tracing::debug!("probing interface {interface}");
+    let resp = iface
+        .control_in(
+            control_in(ctrl_req::PROBE, 0, interface.into(), ctrl_req::PROBE_RESPONSE.len().try_into().unwrap()),
+            TIMEOUT,
+        )
+        .await;
+
+    match resp {
+        Ok(data) => Ok(data.as_slice() == ctrl_req::PROBE_RESPONSE),
+        Err(TransferError::Stall) => Ok(false),
+        Err(err) => Err(transfer_to_io_err(err)),
+    }
+}
+
 pub(crate) struct UpcShared {
     pub(crate) name: String,
     pub(crate) error: Arc<Mutex<Option<TaskError>>>,

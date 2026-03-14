@@ -68,6 +68,8 @@ impl From<Class> for usb_gadget::Class {
 /// Vendor-specific control requests (host → device).
 #[allow(dead_code)]
 mod ctrl_req {
+    /// Probe whether the interface speaks UPC (device responds with [`PROBE_RESPONSE`]).
+    pub const PROBE: u8 = 0;
     /// Open a connection.
     pub const OPEN: u8 = 1;
     /// Close the connection (both directions).
@@ -82,6 +84,9 @@ mod ctrl_req {
     pub const STATUS: u8 = 6;
     /// Query device capabilities (device-to-host) / set host capabilities (host-to-device).
     pub const CAPABILITIES: u8 = 7;
+
+    /// Expected response to a PROBE request.
+    pub const PROBE_RESPONSE: &[u8] = b"UPC";
 }
 
 /// Status response bytes returned by the device in reply to a STATUS control request.
