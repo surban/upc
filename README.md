@@ -43,9 +43,9 @@ Add `upc` to your `Cargo.toml` with the features you need:
 
 ```toml
 [dependencies]
-upc = { version = "1", features = ["host"] }    # host side
+upc = { version = "0.9", features = ["host"] }    # host side
 # or
-upc = { version = "1", features = ["device"] }  # device side
+upc = { version = "0.9", features = ["device"] }  # device side
 ```
 
 ### Host side
