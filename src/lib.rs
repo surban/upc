@@ -1,7 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 #[cfg(any(feature = "host", feature = "device", feature = "web"))]
 use std::{

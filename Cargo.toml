@@ -76,6 +76,6 @@ required-features = ["device"]
 
 [package.metadata.docs.rs]
 features = ["host", "device"]
-rustdoc-args = ["--cfg", "docsrs", "--cfg", "web_sys_unstable_apis"]
+rustdoc-args = ["--cfg", "web_sys_unstable_apis"]
 cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 rustc-args = ["--cfg", "web_sys_unstable_apis"]
