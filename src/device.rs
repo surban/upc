@@ -303,6 +303,10 @@ impl UpcFunction {
     /// Keep the returned `UpcFunction` and pass the [`Handle`] to
     /// [`usb_gadget::Config::with_function`] to include the interface in your
     /// USB gadget.
+    ///
+    /// Use [`InterfaceId::with_guid`] to set a Device Interface GUID so that
+    /// Windows automatically loads the WinUSB driver for this interface.
+    /// Without a GUID, the device will not be accessible on Windows.
     pub fn new(interface_id: InterfaceId) -> (Self, Handle) {
         Self::init(interface_id, |builder| Ok(builder.build())).unwrap()
     }

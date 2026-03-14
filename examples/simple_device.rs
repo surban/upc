@@ -5,19 +5,22 @@ use upc::{
     device::{InterfaceId, UpcFunction},
     Class,
 };
-use usb_gadget::{default_udc, Config, Gadget, Id, Strings};
+use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
+use uuid::uuid;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     let class = Class::vendor_specific(0x01, 0);
 
     // Create a USB gadget with a UPC function.
-    let (mut upc, hnd) = UpcFunction::new(InterfaceId::new(class));
+    let (mut upc, hnd) =
+        UpcFunction::new(InterfaceId::new(class).with_guid(uuid!("3bf77270-42d2-42c6-a475-490227a9cc89")));
     upc.set_info(b"my device".to_vec()).await;
 
     let udc = default_udc().expect("no UDC available");
     let gadget = Gadget::new(class.into(), Id::new(0x1209, 0x0001), Strings::new("mfr", "product", "serial"))
-        .with_config(Config::new("config").with_function(hnd));
+        .with_config(Config::new("config").with_function(hnd))
+        .with_os_descriptor(OsDescriptor::microsoft());
     let _reg = gadget.bind(&udc).expect("cannot bind to UDC");
 
     // Accept a connection and exchange packets.

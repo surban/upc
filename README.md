@@ -10,11 +10,28 @@ It uses a vendor-specific USB interface with bulk endpoints and works with any
 USB device controller (UDC) on the device side and any operating system on the
 host side, including web browsers via [WebUSB].
 
-The library offers an asynchronous Rust API for both the host and device side,
-making it easy to build custom USB communication into your application.
+Unlike standard USB classes (CDC-ACM, HID, etc.) that require
+OS drivers or are limited to specific use cases, UPC operates as a
+vendor-specific interface — your application gets exclusive, direct access
+from userspace. Compared to using raw bulk transfers directly, UPC adds:
+
+* no OS driver interference — the vendor-specific interface is never claimed by the kernel,
+* driverless on Windows — automatically requests the WinUSB driver via Microsoft OS descriptors,
+* packet framing with preserved message boundaries,
+* connection lifecycle management (open, close, capability handshake),
+* independent half-close of send and receive directions,
+* liveness detection via periodic ping/status polling,
+* max packet size negotiation between host and device,
+* cross-platform support: native, Linux gadget, and WebUSB from one codebase.
+
+The library offers an async [Tokio]-based Rust API (with futures `Sink`/`Stream` support) for
+both the host and device side, making it easy to build custom USB communication
+into your application. It contains no `unsafe` code.
+
 A [command-line tool](#cli-tool) is also included for testing, debugging and
 standalone data transfer.
 
+[Tokio]: https://tokio.rs
 [WebUSB]: https://developer.mozilla.org/en-US/docs/Web/API/WebUSB_API
 
 Usage
@@ -59,19 +76,24 @@ async fn main() -> std::io::Result<()> {
 ```rust,no_run
 use std::time::Duration;
 use upc::{device::{InterfaceId, UpcFunction}, Class};
-use usb_gadget::{default_udc, Config, Gadget, Id, Strings};
+use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
+use uuid::uuid;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     let class = Class::vendor_specific(0x01, 0);
 
     // Create a USB gadget with a UPC function.
-    let (mut upc, hnd) = UpcFunction::new(InterfaceId::new(class));
+    let (mut upc, hnd) = UpcFunction::new(
+        InterfaceId::new(class)
+            .with_guid(uuid!("3bf77270-42d2-42c6-a475-490227a9cc89")),
+    );
     upc.set_info(b"my device".to_vec()).await;
 
     let udc = default_udc().expect("no UDC available");
     let gadget = Gadget::new(class.into(), Id::new(0x1209, 0x0001), Strings::new("mfr", "product", "serial"))
-        .with_config(Config::new("config").with_function(hnd));
+        .with_config(Config::new("config").with_function(hnd))
+        .with_os_descriptor(OsDescriptor::microsoft());
     let _reg = gadget.bind(&udc).expect("cannot bind to UDC");
 
     // Accept a connection and exchange packets.
@@ -162,15 +184,6 @@ Connect to a UPC device and forward stdin/stdout:
 
 ```console
 upc connect
-```
-
-### Debugging
-
-Set `RUST_LOG` to enable diagnostic output on stderr:
-
-```console
-RUST_LOG=debug upc connect
-RUST_LOG=upc=trace upc device
 ```
 
 License
