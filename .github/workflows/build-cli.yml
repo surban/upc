@@ -51,7 +51,7 @@ jobs:
             use_cross: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Update Rust
         run: rustup update
@@ -72,7 +72,7 @@ jobs:
         run: cp target/${{ matrix.target }}/release/upc${{ matrix.ext }} ${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -86,7 +86,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
 
       - name: Attach binaries to release
         uses: softprops/action-gh-release@v2
