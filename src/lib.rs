@@ -3,22 +3,11 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
 use std::{
     io::{Error, ErrorKind},
     time::Duration,
 };
-
-/// Creates an I/O error for a closed UPC channel.
-///
-/// For [`ErrorKind::BrokenPipe`] this produces "UPC channel closed";
-/// for other kinds it uses the standard error text.
-pub(crate) fn channel_error(kind: ErrorKind) -> Error {
-    if kind == ErrorKind::BrokenPipe {
-        Error::new(kind, "UPC channel closed")
-    } else {
-        kind.into()
-    }
-}
 
 #[cfg(feature = "device")]
 pub mod device;
@@ -139,6 +128,7 @@ mod tlv {
 /// Encoded using a TLV (tag-length-value) format for forward and backward
 /// compatibility: unknown tags are silently skipped during decoding and
 /// missing tags fall back to their default values.
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeviceCapabilities {
     /// Ping timeout duration.
@@ -149,12 +139,14 @@ pub(crate) struct DeviceCapabilities {
     pub max_packet_size: u64,
 }
 
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
 impl Default for DeviceCapabilities {
     fn default() -> Self {
         Self { ping_timeout: None, status_supported: false, max_packet_size: MAX_SIZE as u64 }
     }
 }
 
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
 impl DeviceCapabilities {
     /// Maximum encoded capabilities size.
     #[cfg(any(feature = "host", feature = "web"))]
@@ -228,18 +220,21 @@ impl DeviceCapabilities {
 /// Encoded using a TLV (tag-length-value) format for forward and backward
 /// compatibility: unknown tags are silently skipped during decoding and
 /// missing tags fall back to their default values.
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostCapabilities {
     /// Maximum receive packet size.
     pub max_packet_size: u64,
 }
 
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
 impl Default for HostCapabilities {
     fn default() -> Self {
         Self { max_packet_size: MAX_SIZE as u64 }
     }
 }
 
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
 impl HostCapabilities {
     /// Maximum encoded capabilities size.
     #[allow(dead_code)]
@@ -277,5 +272,18 @@ impl HostCapabilities {
             }
         }
         Ok(caps)
+    }
+}
+
+/// Creates an I/O error for a closed UPC channel.
+///
+/// For [`ErrorKind::BrokenPipe`] this produces "UPC channel closed";
+/// for other kinds it uses the standard error text.
+#[cfg(any(feature = "host", feature = "device", feature = "web"))]
+pub(crate) fn channel_error(kind: ErrorKind) -> Error {
+    if kind == ErrorKind::BrokenPipe {
+        Error::new(kind, "UPC channel closed")
+    } else {
+        kind.into()
     }
 }

@@ -28,6 +28,7 @@ use upc::Class;
 /// Default UPC interface protocol (hex string).
 const DEFAULT_PROTOCOL: &str = "84";
 /// Default Device Interface GUID for Microsoft OS (Windows).
+#[cfg(feature = "device")]
 const DEFAULT_GUID: &str = "19840902-89fc-40d8-bc10-f71079b789b5";
 /// Idle timeout after stdin closes on an interactive terminal.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
