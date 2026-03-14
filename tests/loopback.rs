@@ -76,7 +76,7 @@ impl TestData {
 
 // ── The actual loopback test ─────────────────────────────────────────────────
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn loopback() {
     init_log();
@@ -118,15 +118,24 @@ async fn loopback() {
         let dev_recv_task = tokio::spawn(async move {
             let mut rx_td = TestData::new(HOST_SEED, TEST_PACKET_MAX_SIZE);
 
+            let start = Instant::now();
+            let mut total = 0usize;
+
             println!("[device-rx] Receiving…");
             for n in 0..TEST_PACKETS {
                 let data = dev_rx.recv().await.expect("device recv failed").expect("unexpected EOF");
                 if n % 50 == 0 {
                     println!("[device-rx] packet {n}: {} bytes", data.len());
                 }
+                total += data.len();
                 rx_td.validate(&data);
             }
-            println!("[device-rx] All {} packets received and validated", TEST_PACKETS);
+
+            let elapsed = start.elapsed().as_secs_f32();
+            println!(
+                "[device-rx] Received {total} bytes in {elapsed:.2}s ({:.2} MB/s)",
+                total as f32 / elapsed / 1_048_576.
+            );
 
             // Wait for sender to close.
             assert_eq!(dev_rx.recv().await.unwrap(), None, "device receiver not closed");
@@ -285,7 +294,7 @@ async fn loopback() {
 const DEVICE_MAX_SIZE: u64 = 1_000_000;
 const HOST_MAX_SIZE: usize = 2_000_000;
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn max_packet_size_exchange() {
     init_log();
