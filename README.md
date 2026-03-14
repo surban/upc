@@ -17,6 +17,78 @@ standalone data transfer.
 
 [WebUSB]: https://developer.mozilla.org/en-US/docs/Web/API/WebUSB_API
 
+Usage
+-----
+
+Add `upc` to your `Cargo.toml` with the features you need:
+
+```toml
+[dependencies]
+upc = { version = "1", features = ["host"] }    # host side
+# or
+upc = { version = "1", features = ["device"] }  # device side
+```
+
+### Host side
+
+```rust,no_run
+use upc::{host::{connect, find_interface}, Class};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> std::io::Result<()> {
+    let class = Class::vendor_specific(0x01, 0);
+
+    // Find and open the USB device.
+    let dev_info = nusb::list_devices().await?
+        .find(|d| d.vendor_id() == 0x1209 && d.product_id() == 0x0001)
+        .expect("device not found");
+    let iface = find_interface(&dev_info, class)?;
+    let dev = dev_info.open().await?;
+
+    // Connect and exchange packets.
+    let (tx, mut rx) = connect(dev, iface, b"hello").await?;
+    tx.send(b"ping"[..].into()).await?;
+    let reply = rx.recv().await?;
+    println!("received: {:?}", reply);
+    Ok(())
+}
+```
+
+### Device side
+
+```rust,no_run
+use std::time::Duration;
+use upc::{device::{InterfaceId, UpcFunction}, Class};
+use usb_gadget::{default_udc, Config, Gadget, Id, Strings};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> std::io::Result<()> {
+    let class = Class::vendor_specific(0x01, 0);
+
+    // Create a USB gadget with a UPC function.
+    let (mut upc, hnd) = UpcFunction::new(InterfaceId::new(class));
+    upc.set_info(b"my device".to_vec()).await;
+
+    let udc = default_udc().expect("no UDC available");
+    let gadget = Gadget::new(class.into(), Id::new(0x1209, 0x0001), Strings::new("mfr", "product", "serial"))
+        .with_config(Config::new("config").with_function(hnd));
+    let _reg = gadget.bind(&udc).expect("cannot bind to UDC");
+
+    // Accept a connection and exchange packets.
+    let (tx, mut rx) = upc.accept().await?;
+    if let Some(data) = rx.recv().await? {
+        println!("received: {:?}", data);
+        tx.send(b"pong"[..].into()).await?;
+    }
+
+    // Allow USB transport to flush before teardown.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Ok(())
+}
+```
+
+See the [examples](examples/) directory and [API documentation](https://docs.rs/upc) for more details.
+
 Features
 --------
 
@@ -33,7 +105,7 @@ Additionally, the feature `trace-packets` can be enabled to log USB packets at l
 Requirements
 ------------
 
-The minimum support Rust version (MSRV) is 1.85.
+The minimum supported Rust version (MSRV) is 1.85.
 
 The native host-side part supports any operating system supported by [nusb].
 
@@ -67,11 +139,7 @@ upc device
 
 This creates a USB gadget with default VID/PID and waits for a host to connect.
 Data received from the host is written to stdout; data read from stdin is sent
-to the host. Customize with options:
-
-```console
-upc device --serial "my-device" --info "sensor v1" --subclass 01
-```
+to the host. 
 
 ### Host side
 
@@ -95,20 +163,6 @@ Connect to a UPC device and forward stdin/stdout:
 ```console
 upc connect
 ```
-
-If multiple UPC devices are connected, narrow down with filters:
-
-```console
-upc connect --serial "my-device"
-upc connect --vid 1209 --pid 0001
-upc connect --subclass 01
-upc connect --bus 1 --address 5
-```
-
-### Framing
-
-By default, each line on stdin becomes one UPC packet (`--framing line`).
-Use `--framing raw` for binary data where each read becomes a packet.
 
 ### Debugging
 

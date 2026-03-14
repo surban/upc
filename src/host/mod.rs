@@ -1,7 +1,7 @@
 #![allow(rustdoc::broken_intra_doc_links)]
 //! Host-side USB packet channel (UPC)
 //!
-//! ### Native platforms (crate feature `native`)
+//! ### Native platforms (crate feature `host`)
 //!
 //! To open a channel, use [`nusb`] to find the target device and then pass it to [`connect`].
 //!

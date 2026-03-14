@@ -66,6 +66,14 @@ name = "device"
 required-features = ["device"]
 doc-scrape-examples = true
 
+[[example]]
+name = "simple_host"
+required-features = ["host"]
+
+[[example]]
+name = "simple_device"
+required-features = ["device"]
+
 [package.metadata.docs.rs]
 features = ["host", "device"]
 rustdoc-args = ["--cfg", "docsrs", "--cfg", "web_sys_unstable_apis"]
