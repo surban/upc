@@ -12,6 +12,7 @@ use std::{
     io::{self, IsTerminal, Write},
     pin::pin,
     process::ExitCode,
+    sync::Arc,
     time::Duration,
 };
 
@@ -19,7 +20,8 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand, ValueEnum};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    time::sleep,
+    sync::Notify,
+    time::{sleep, Instant},
 };
 use upc::Class;
 
@@ -27,6 +29,8 @@ use upc::Class;
 const DEFAULT_PROTOCOL: &str = "84";
 /// Default Device Interface GUID for Microsoft OS (Windows).
 const DEFAULT_GUID: &str = "19840902-89fc-40d8-bc10-f71079b789b5";
+/// Idle timeout after stdin closes on an interactive terminal.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 // ---- Traits for abstracting over host/device UPC types ----
 
@@ -126,9 +130,11 @@ async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing)
     let mut stdin = tokio::io::stdin();
     let stdout = io::stdout();
 
+    let interactive = std::io::stdin().is_terminal();
+
     let framing = match framing {
         Framing::Auto => {
-            if std::io::stdin().is_terminal() {
+            if interactive {
                 Framing::Line
             } else {
                 Framing::Raw
@@ -137,6 +143,10 @@ async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing)
         other => other,
     };
 
+    // Notify: send_fut signals recv_fut when stdin is closed on a terminal.
+    let stdin_closed = Arc::new(Notify::new());
+
+    let stdin_closed2 = stdin_closed.clone();
     let send_fut = async move {
         let max_send = tx.upc_max_size();
         let mut closed = pin!(tx.upc_closed());
@@ -188,24 +198,40 @@ async fn forward_stdio(tx: impl UpcSend, mut rx: impl UpcRecv, framing: Framing)
             Framing::Auto => unreachable!(),
         };
         close_stdin();
+        if interactive {
+            stdin_closed2.notify_one();
+        }
         res
     };
 
     let recv_fut = async move {
+        let mut idle_timeout = pin!(sleep(Duration::MAX));
+        let mut stdin_done = false;
+
         let res: io::Result<()> = loop {
-            match rx.upc_recv().await {
-                Ok(Some(data)) => {
-                    let mut stdout = stdout.lock();
-                    if let Err(err) = stdout.write_all(&data).and_then(|_| stdout.flush()) {
-                        if is_broken_pipe(&err) {
-                            break Ok(());
+            tokio::select! {
+                result = rx.upc_recv() => match result {
+                    Ok(Some(data)) => {
+                        if stdin_done {
+                            idle_timeout.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
                         }
-                        break Err(err);
+                        let mut stdout = stdout.lock();
+                        if let Err(err) = stdout.write_all(&data).and_then(|_| stdout.flush()) {
+                            if is_broken_pipe(&err) {
+                                break Ok(());
+                            }
+                            break Err(err);
+                        }
                     }
+                    Ok(None) => break Ok(()),
+                    Err(err) if is_broken_pipe(&err) => break Ok(()),
+                    Err(err) => break Err(err),
+                },
+                () = stdin_closed.notified(), if !stdin_done => {
+                    stdin_done = true;
+                    idle_timeout.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
                 }
-                Ok(None) => break Ok(()),
-                Err(err) if is_broken_pipe(&err) => break Ok(()),
-                Err(err) => break Err(err),
+                () = &mut idle_timeout => break Ok(()),
             }
         };
         close_stdout();
@@ -569,12 +595,13 @@ impl ConnectCmd {
             }
         };
 
-        if let Err(err) = forward_stdio(tx, rx, self.framing).await {
-            eprintln!("Error: {err:#}");
-            std::process::exit(1);
+        match forward_stdio(tx, rx, self.framing).await {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("Error: {err:#}");
+                std::process::exit(1);
+            }
         }
-
-        ExitCode::SUCCESS
     }
 }
 
@@ -635,6 +662,8 @@ struct DeviceCmd {
 #[cfg(feature = "device")]
 impl DeviceCmd {
     async fn exec(self) -> ExitCode {
+        use std::process;
+
         use upc::device::{InterfaceId, UpcFunction};
         use usb_gadget::{default_udc, Config, Gadget, Id, OsDescriptor, Strings};
 
@@ -696,12 +725,13 @@ impl DeviceCmd {
             }
         };
 
-        if let Err(err) = forward_stdio(tx, rx, self.framing).await {
-            eprintln!("Error: {err:#}");
-            std::process::exit(1);
+        match forward_stdio(tx, rx, self.framing).await {
+            Ok(()) => process::exit(0),
+            Err(err) => {
+                eprintln!("Error: {err:#}");
+                process::exit(1);
+            }
         }
-
-        ExitCode::SUCCESS
     }
 }
 
