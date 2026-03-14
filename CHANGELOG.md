@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog],
 and this project adheres to [Semantic Versioning].
 
+[Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
+[Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+
 ## 0.9.0 - 2026-03-14
 ### Added
 - protocol specification document (`PROTOCOL.md`)
@@ -41,12 +44,10 @@ and this project adheres to [Semantic Versioning].
 - Update webusb-web to 0.4.0
 
 ## 0.6.0 - 2025-02-10
-### Fixed
-- WebUSB: flush buffer on connect
-
-## 0.6.0 - 2025-02-10
 ### Added
 - WebUSB support
+### Fixed
+- WebUSB: flush buffer on connect
 
 ## 0.5.0 - 2024-04-29
 ### Added

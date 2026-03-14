@@ -381,7 +381,7 @@ impl UpcFunction {
         self.cfg.lock().await.max_packet_size
     }
 
-    /// Sets the maximum revice packet size accepted.
+    /// Sets the maximum receive packet size accepted.
     ///
     /// The default is [`MAX_SIZE`].
     pub async fn set_max_size(&self, max_size: u64) {
