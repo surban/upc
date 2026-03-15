@@ -75,7 +75,7 @@ impl From<webusb_web::Error> for TaskError {
 
 /// Sleep for the specified duration.
 async fn sleep(duration: Duration) {
-    let ms = duration.as_millis() as i32;
+    let ms = duration.as_millis().try_into().unwrap_or(i32::MAX);
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();
         if let Some(window) = global.dyn_ref::<web_sys::Window>() {

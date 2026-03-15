@@ -557,7 +557,7 @@ async fn out_task(
         let data_len = data.len();
         total_bytes_sent = total_bytes_sent.wrapping_add(data_len as u64);
 
-        // Send data via ons USB transfer.
+        // Send data via one USB transfer.
         tracer.sending_data(data_len);
         tracer.send_part(data_len);
         ep.submit(Buffer::from(Vec::from(data)));
