@@ -362,7 +362,7 @@ pub async fn connect_with(dev: Device, interface: u8, options: UpcOptions) -> Re
     tracing::debug!("flushing buffers");
     loop {
         ep_in.submit(Buffer::new(mps));
-        match timeout(Duration::from_millis(10), ep_in.next_complete()).await {
+        match timeout(crate::FLUSH_TIMEOUT, ep_in.next_complete()).await {
             Ok(Completion { status: Ok(()), .. }) => (),
             Ok(Completion { status: Err(_), .. }) => break,
             Err(_) => {

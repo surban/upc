@@ -20,7 +20,7 @@ use std::{
 use tokio::{
     sync::{mpsc, watch, Mutex},
     task::JoinSet,
-    time::{sleep, Instant},
+    time::{sleep, timeout, Instant},
 };
 use uuid::Uuid;
 
@@ -480,7 +480,11 @@ impl UpcFunction {
     /// Prepare USB IN transfers
     async fn prepare_in(ep_rx: &Mutex<EndpointReceiver>, max_transfer_size: usize, pool: &mut BytesPool) {
         let mut ep_rx = ep_rx.lock().await;
-        while ep_rx.try_recv(pool.chunk(max_transfer_size)).is_ok() {}
+
+        // Drain receive queue and pre-post receive buffers.
+        while let Ok(Ok(_)) = timeout(crate::FLUSH_TIMEOUT, ep_rx.recv_async(pool.chunk(max_transfer_size))).await
+        {
+        }
     }
 
     /// Task that performs USB IN transfers.
@@ -682,6 +686,10 @@ impl UpcFunction {
                                     // Clear any halt status left from a previous connection's half-close.
                                     let _ = ep_tx.lock().await.control()?.clear_halt();
                                     let _ = ep_rx.lock().await.control()?.clear_halt();
+
+                                    // Discard stale data in hardware FIFOs from a previous connection.
+                                    let _ = ep_tx.lock().await.control()?.discard_fifo();
+                                    let _ = ep_rx.lock().await.control()?.discard_fifo();
 
                                     // Determine limits.
                                     let max_transfer_size = mps.expect("request without enable") * TRANSFER_PACKETS;

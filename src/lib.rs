@@ -3,10 +3,8 @@
 #![warn(missing_docs)]
 
 #[cfg(any(feature = "host", feature = "device", feature = "web"))]
-use std::{
-    io::{Error, ErrorKind},
-    time::Duration,
-};
+use std::io::{Error, ErrorKind};
+use std::time::Duration;
 
 #[cfg(feature = "device")]
 pub mod device;
@@ -33,6 +31,10 @@ pub const TRANSFER_PACKETS: usize = 128;
 /// Length of send and receive queues.
 #[allow(dead_code)]
 const QUEUE_LEN: usize = 32;
+
+/// Timeout for flushing stale data from endpoints during connection setup.
+#[allow(dead_code)]
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// USB interface class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -431,7 +431,7 @@ pub async fn connect_with(
         tokio::select! {
             biased;
             Some(_) = rx_in.recv() => (),
-            () = sleep(Duration::from_millis(10)) => break,
+            () = sleep(crate::FLUSH_TIMEOUT) => break,
         }
     }
 
