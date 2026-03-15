@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
+## 0.10.1 - 2026-03-15
+### Fixed
+- device: complete failure after unknown control requests
+
 ## 0.10.0 - 2026-03-15
 ### Added
 - device: configurable receive memory pool (`recv_pool_size`, `set_recv_pool_size`)
