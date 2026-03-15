@@ -1284,9 +1284,9 @@ dependencies = [
 
 [[package]]
 name = "webusb-web"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "946575140504f2f452d4f5518f6cefe4bd62117151e7878d47c46d1db2d12f8a"
+checksum = "480abaf29ba9c488f9d9bc58c9dbd2aab6f3b7b3c9726d7a526625d635998aa1"
 dependencies = [
  "futures-core",
  "futures-util",

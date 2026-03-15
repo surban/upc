@@ -128,7 +128,7 @@ pub async fn info(hnd: &OpenUsbDevice, interface: u8) -> Result<Vec<u8>> {
     );
     let info = hnd.control_transfer_in(&req, INFO_SIZE as _).await.map_err(web_to_io_err)?;
 
-    Ok(info)
+    Ok(info.to_vec())
 }
 
 /// Probe whether the specified interface speaks the UPC protocol.
@@ -148,7 +148,7 @@ pub async fn probe(hnd: &OpenUsbDevice, interface: u8) -> Result<bool> {
     );
 
     match hnd.control_transfer_in(&req, ctrl_req::PROBE_RESPONSE.len() as _).await {
-        Ok(data) => Ok(data.as_slice() == ctrl_req::PROBE_RESPONSE),
+        Ok(data) => Ok(data.to_vec() == ctrl_req::PROBE_RESPONSE),
         Err(err) if err.kind() == webusb_web::ErrorKind::Stall => Ok(false),
         Err(err) => Err(web_to_io_err(err)),
     }
@@ -346,7 +346,7 @@ pub async fn connect_with(
         interface.into(),
     );
     let caps = match hnd.control_transfer_in(&req, DeviceCapabilities::SIZE as _).await {
-        Ok(data) => DeviceCapabilities::decode(&data)?,
+        Ok(data) => DeviceCapabilities::decode(&data.to_vec())?,
         Err(err) => {
             tracing::debug!("capabilities query failed: {err}");
             DeviceCapabilities::default()
@@ -491,7 +491,7 @@ async fn in_task(
         match res {
             Ok(buf) => {
                 tracer.received_packet(buf.len());
-                if tx.send(RecvPacket(Bytes::from(buf))).await.is_err() {
+                if tx.send(RecvPacket(Bytes::from(buf.to_vec()))).await.is_err() {
                     break true;
                 }
             }
@@ -606,6 +606,7 @@ async fn status_task(
 
         match hnd.control_transfer_in(&req, status::MAX_SIZE as _).await {
             Ok(data) => {
+                let data = data.to_vec();
                 for &byte in &data {
                     match byte {
                         status::RECV_CLOSED => {

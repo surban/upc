@@ -54,6 +54,8 @@ async fn web() {
     log!("Connecting...");
     let (tx, mut rx) = connect(Rc::new(hnd), iface, TOPIC).await.expect_log("cannot connect");
 
+    let overall_start = js_sys::Date::now();
+
     let (rx_task_done_tx, rx_task_done_rx) = oneshot::channel();
     let (rx_task_finished_tx, rx_task_finished_rx) = oneshot::channel();
     spawn_local(async move {
@@ -61,7 +63,7 @@ async fn web() {
         let mut rx_delay = TestDelayer::new(DEVICE_SEED);
 
         let start = js_sys::Date::now();
-        let mut total = 0;
+        let mut total = 0usize;
 
         log!("Receiving...");
         for n in 0..TEST_PACKETS {
@@ -75,7 +77,7 @@ async fn web() {
         let elapsed = (js_sys::Date::now() - start) / 1000.;
         log!("Received {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f64 / elapsed / 1_048_576.);
 
-        rx_task_done_tx.send(()).unwrap();
+        rx_task_done_tx.send(total).unwrap();
 
         log!("Waiting for receiver close");
         assert_eq!(rx.recv().await.unwrap(), None, "receiver not closed");
@@ -88,23 +90,31 @@ async fn web() {
     let mut tx_delay = TestDelayer::new(HOST_SEED);
 
     let start = js_sys::Date::now();
-    let mut total = 0;
+    let mut tx_total = 0;
 
     log!("Sending");
     for n in 0..TEST_PACKETS {
         let data = tx_testdata.generate();
         let len = data.len();
         tx.send(data.into()).await.expect_log("send failed");
-        total += len;
+        tx_total += len;
         tx_delay.delay().await;
 
         log!("Send {n}: {len} bytes");
     }
 
     let elapsed = (js_sys::Date::now() - start) / 1000.;
-    log!("Sent {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f64 / elapsed / 1_048_576.);
+    log!("Sent {tx_total} bytes in {elapsed:.2} seconds: {} MB/s", tx_total as f64 / elapsed / 1_048_576.);
 
-    rx_task_done_rx.await.unwrap();
+    let rx_total = rx_task_done_rx.await.unwrap();
+
+    let overall_elapsed = (js_sys::Date::now() - overall_start) / 1000.;
+    let total_bytes = tx_total + rx_total;
+    log!(
+        "Total throughput: {} bytes in {overall_elapsed:.2} seconds: {:.2} MB/s",
+        total_bytes,
+        total_bytes as f64 / overall_elapsed / 1_048_576.
+    );
 
     log!("Disconnecting...");
     drop(tx);
