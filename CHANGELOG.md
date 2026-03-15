@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
+## 0.10.2 - 2026-03-15
+### Fixed
+- device: flush hardware FIFOs and drain stale data during connection setup
+- host: increase flush timeout from 10 ms to 100 ms
+
 ## 0.10.1 - 2026-03-15
 ### Fixed
 - device: complete failure after unknown control requests
