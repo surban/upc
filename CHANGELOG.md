@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
+## 0.10.0 - 2026-03-15
+### Added
+- device: configurable receive memory pool (`recv_pool_size`, `set_recv_pool_size`)
+### Changed
+- host (native): use DMA buffers to avoid unnecessary copies on receive path
+- device: use receive memory pool to avoid copying
+- update webusb-web dependency to 0.5
+
 ## 0.9.1 - 2026-03-14
 ### Fixed
 - docs.rs build
@@ -27,7 +35,6 @@ and this project adheres to [Semantic Versioning].
 - `probe()` function for auto-discovery of UPC interfaces
 - `upc` CLI tool with `scan`, `list`, `connect`, and `device` subcommands (feature `cli`)
 - retry logic for claiming USB interface on connect
-
 ### Changed
 - **Breaking:** `UpcReceiver::recv()` returns `Result<Option<..>>` instead of `Result<..>`
 

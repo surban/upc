@@ -132,7 +132,7 @@ Requirements
 
 The minimum supported Rust version (MSRV) is 1.85.
 
-The native host-side part supports Linux, macOS and Windows via [nusb].
+The native host-side part supports Linux, Android, macOS and Windows via [nusb].
 The WebUSB host-side part works in browsers with WebUSB support (Chrome, Edge).
 
 The device-side part requires Linux and a USB device controller (UDC).
