@@ -188,4 +188,5 @@ mod inner {
     }
 }
 
+#[allow(unused)]
 pub(crate) use inner::Tracer;

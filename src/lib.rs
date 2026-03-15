@@ -31,6 +31,7 @@ pub const MAX_SIZE: usize = 16_777_216;
 pub const TRANSFER_PACKETS: usize = 128;
 
 /// Length of send and receive queues.
+#[allow(dead_code)]
 const QUEUE_LEN: usize = 32;
 
 /// USB interface class.
