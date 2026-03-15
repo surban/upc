@@ -1067,9 +1067,9 @@ dependencies = [
 
 [[package]]
 name = "usb-gadget"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bffda17a3107e1e478e7e321119ff9a8f15158015604d23ee92283c82720e73c"
+checksum = "7010a310d9c6caac0282c94a0ab830d7dec675bb62241553f681cc795e0f4d31"
 dependencies = [
  "bitflags",
  "byteorder",
