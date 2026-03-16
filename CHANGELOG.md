@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
+## 0.10.4 - 2026-03-16
+### Fixed
+- host (web): cancel orphaned IN transfers from previous connection on reconnect
+- host (web): release USB interface on connection close
+
 ## 0.10.3 - 2026-03-16
 ### Change
 - device: flush hardware FIFOs at connection close and device disable
