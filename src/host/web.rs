@@ -320,7 +320,9 @@ pub async fn connect_with(
     };
     let max_transfer_size = mps * TRANSFER_PACKETS;
 
-    // Open device and claim interface.
+    // Release and re-claim interface to cancel any orphaned IN transfers
+    // from a previous connection that was not properly closed.
+    let _ = hnd.release_interface(interface).await;
     hnd.claim_interface(interface).await.map_err(web_to_io_err)?;
     hnd.clear_halt(UsbDirection::In, ep_in).await.map_err(web_to_io_err)?;
     hnd.clear_halt(UsbDirection::Out, ep_out).await.map_err(web_to_io_err)?;
