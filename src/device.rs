@@ -659,6 +659,8 @@ impl UpcFunction {
                             out_task = future::pending().boxed();
                             ep_tx.lock().await.cancel()?;
                             ep_rx.lock().await.cancel()?;
+                            let _ = ep_tx.lock().await.control()?.discard_fifo();
+                            let _ = ep_rx.lock().await.control()?.discard_fifo();
                             send_open = false;
                             recv_open = false;
                             mps = None;
@@ -732,6 +734,8 @@ impl UpcFunction {
                                     out_task = future::pending().boxed();
                                     ep_tx.lock().await.cancel()?;
                                     ep_rx.lock().await.cancel()?;
+                                    let _ = ep_tx.lock().await.control()?.discard_fifo();
+                                    let _ = ep_rx.lock().await.control()?.discard_fifo();
                                     if let Err(err) = req.recv_all() {
                                         tracing::warn!("close request receive error: {err}");
                                     }
