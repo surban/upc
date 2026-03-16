@@ -237,6 +237,11 @@ impl HalfCloseHandle {
             if let Err(err) = self.hnd.control_transfer_out(&control, &[]).await {
                 tracing::warn!("closing connection failed: {err}");
             }
+
+            // Release the interface.
+            if let Err(err) = self.hnd.release_interface(self.iface).await {
+                tracing::warn!("releasing interface failed: {err}");
+            }
         }
     }
 }
