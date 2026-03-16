@@ -1042,7 +1042,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "upc"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "bytes",
  "clap",
@@ -1284,9 +1284,9 @@ dependencies = [
 
 [[package]]
 name = "webusb-web"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "480abaf29ba9c488f9d9bc58c9dbd2aab6f3b7b3c9726d7a526625d635998aa1"
+checksum = "b6d552dd23f3af598c8d51cd7c1e4f2ae350f527a350fe3a34f8ba7245b38dd8"
 dependencies = [
  "futures-core",
  "futures-util",
