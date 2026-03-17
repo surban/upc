@@ -449,7 +449,13 @@ pub async fn connect_with(
     // marker with fresh random data and try again.
     if caps.echo_supported {
         tracing::debug!("draining stale data using ECHO barrier");
+        let mut retries = 50;
         'barrier: loop {
+            if retries == 0 {
+                return Err(Error::new(ErrorKind::TimedOut, "ECHO barrier failed"));
+            }
+            retries -= 1;
+
             let mut echo_marker = vec![0u8; mps.saturating_sub(1)];
             getrandom::fill(&mut echo_marker).expect("failed to generate random bytes");
             tracing::debug!("sending ECHO barrier ({} bytes)", echo_marker.len());
