@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
+## 0.10.6 - 2026-03-17
+### Changed
+- device: OPEN no longer implicitly closes a previous connection
+- device: endpoint cleanup (clear halt, discard FIFOs) moved from OPEN to CLOSE handler
+
 ## 0.10.5 - 2026-03-17
 ### Added
 - device: ECHO request handler that echoes marker data back via bulk IN
