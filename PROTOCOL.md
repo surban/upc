@@ -98,6 +98,8 @@ Opens a new connection.
 
 * The host **must** send OPEN before transmitting data on the bulk
   endpoints.
+* The host **must** send CLOSE before OPEN to clear any state from a
+  previous connection (see CLOSE below).
 * The data payload contains a user-defined **topic** (0 to 4096 bytes).
   The topic is delivered to the device application and may carry
   connection metadata (e.g. a service name).
@@ -108,8 +110,7 @@ Opens a new connection.
   device application does not recognize the topic, it **may**
   immediately close the connection after accepting.
 * If OPEN is received while a connection is already active, the device
-  **must** close the previous connection (as if CLOSE were received)
-  and open a new one.
+  **should** ignore the request.
 
 ### CLOSE (0x02) — Host → Device
 
@@ -117,11 +118,15 @@ Closes the connection in both directions.
 
 * The host **must** send CLOSE when the connection is fully torn down
   (both directions closed).
-* The host **should** also send CLOSE at the start of a new connection
-  (before OPEN) to ensure any stale state from a previous connection is
-  cleaned up.
-* On receiving CLOSE, the device **must** stop all bulk endpoint
-  activity and reset its connection state.
+* The host **must** send CLOSE before OPEN when establishing a new
+  connection so that all state from any previous connection is cleaned
+  up.
+* On receiving CLOSE, the device **must**:
+  1. Stop all bulk endpoint activity.
+  2. Cancel all pending asynchronous I/O on both endpoints.
+  3. Clear any halt condition on both bulk endpoints.
+  4. Discard any stale data remaining in hardware FIFOs.
+  5. Reset its connection state.
 
 ### INFO (0x03) — Device → Host
 
@@ -417,9 +422,9 @@ connection. Steps marked *(optional)* may be skipped.
   │──── INFO (optional) ──────────────────────>│
   │<─── info bytes ───────────────────────────│
   │                                            │
-  │  [claim interface, clear halt on both EPs] │
+  │  [claim interface]                          │
   │                                            │
-  │──── CLOSE (reset previous state) ────────>│
+  │──── CLOSE (mandatory reset) ─────────────>│
   │                                            │
   │──── CAPABILITIES IN (optional) ───────────>│
   │<─── device capabilities (TLV) ────────────│
@@ -442,8 +447,10 @@ Detailed steps:
 
 1. *(Optional)* Send **PROBE** to verify the interface speaks UPC.
 2. *(Optional)* Send **INFO** to read device information.
-3. Claim the USB interface. Clear halt condition on both bulk endpoints.
-4. Send **CLOSE** to reset any state from a previous connection.
+3. Claim the USB interface.
+4. Send **CLOSE** to reset any state from a previous connection. This
+   is mandatory — the device clears halt conditions, discards stale
+   FIFO data, and resets connection state upon receiving CLOSE.
 5. *(Optional)* Send **CAPABILITIES IN** to query device capabilities.
    On failure, use defaults.
 6. *(Optional)* Send **CAPABILITIES OUT** to inform the device of host
@@ -499,9 +506,9 @@ the connection.
 
 **Endpoint halt persistence:**
 Endpoint halt conditions set during half-close (e.g. device halting
-the IN or OUT endpoint) persist until the next connection. The host
-clears halt conditions on both endpoints as part of establishing a
-new connection (step 3 above).
+the IN or OUT endpoint) persist until the next CLOSE. The device
+clears halt conditions on both endpoints when it processes CLOSE
+(see step 4 of connection establishment above).
 
 ```
  Host                                        Device

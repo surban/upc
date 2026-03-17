@@ -655,43 +655,40 @@ impl UpcFunction {
 
                         Event::Disable => {
                             tracing::debug!("device disabled");
+
+                            // Stop tasks.
                             in_task = future::pending().boxed();
                             out_task = future::pending().boxed();
+
+                            // Clear all AIO queues.
                             ep_tx.lock().await.cancel()?;
                             ep_rx.lock().await.cancel()?;
+
+                            // Clear any halt status from connection's half-close.
+                            let _ = ep_tx.lock().await.control()?.clear_halt();
+                            let _ = ep_rx.lock().await.control()?.clear_halt();
+
+                            // Discard stale data in hardware FIFOs.
                             let _ = ep_tx.lock().await.control()?.discard_fifo();
                             let _ = ep_rx.lock().await.control()?.discard_fifo();
+
                             send_open = false;
                             recv_open = false;
+                            host_caps = HostCapabilities::default();
                             mps = None;
                         }
 
                         Event::SetupHostToDevice(req) => {
                             let ctrl_req = req.ctrl_req();
-                            tracing::debug!("incoming control request: {ctrl_req:?}");
+                            tracing::trace!("incoming control request: {ctrl_req:?}");
                             match ctrl_req.request {
                                 ctrl_req::OPEN => {
                                     tracing::debug!("open connection request");
 
-                                    // Close any previous connection.
                                     if send_open || recv_open {
-                                        tracing::debug!("closing previous connection");
-                                        in_task = future::pending().boxed();
-                                        out_task = future::pending().boxed();
-                                        ep_tx.lock().await.cancel()?;
-                                        ep_rx.lock().await.cancel()?;
-                                        send_open = false;
-                                        recv_open = false;
-                                        host_caps = HostCapabilities::default();
+                                        tracing::warn!("conection is already open");
+                                        continue;
                                     }
-
-                                    // Clear any halt status left from a previous connection's half-close.
-                                    let _ = ep_tx.lock().await.control()?.clear_halt();
-                                    let _ = ep_rx.lock().await.control()?.clear_halt();
-
-                                    // Discard stale data in hardware FIFOs from a previous connection.
-                                    let _ = ep_tx.lock().await.control()?.discard_fifo();
-                                    let _ = ep_rx.lock().await.control()?.discard_fifo();
 
                                     // Determine limits.
                                     let max_transfer_size = mps.expect("request without enable") * TRANSFER_PACKETS;
@@ -730,15 +727,27 @@ impl UpcFunction {
 
                                 ctrl_req::CLOSE => {
                                     tracing::debug!("close connection request");
+
+                                    // Stop tasks.
                                     in_task = future::pending().boxed();
                                     out_task = future::pending().boxed();
+
+                                    // Clear all AIO queues.
                                     ep_tx.lock().await.cancel()?;
                                     ep_rx.lock().await.cancel()?;
+
+                                    // Clear any halt status from connection's half-close.
+                                    let _ = ep_tx.lock().await.control()?.clear_halt();
+                                    let _ = ep_rx.lock().await.control()?.clear_halt();
+
+                                    // Discard stale data in hardware FIFOs.
                                     let _ = ep_tx.lock().await.control()?.discard_fifo();
                                     let _ = ep_rx.lock().await.control()?.discard_fifo();
+
                                     if let Err(err) = req.recv_all() {
                                         tracing::warn!("close request receive error: {err}");
                                     }
+
                                     send_open = false;
                                     recv_open = false;
                                     host_caps = HostCapabilities::default();
@@ -785,22 +794,24 @@ impl UpcFunction {
                                 }
 
                                 ctrl_req::ECHO => {
-                                    if !send_open && !recv_open {
-                                        match req.recv_all() {
-                                            Ok(data) => {
-                                                tracing::debug!("echoing {} bytes via bulk IN", data.len());
-                                                let mut ep = ep_tx.lock().await;
-                                                if let Err(err) = ep.send_async(Bytes::from(data)).await {
-                                                    tracing::warn!("echo send error: {err}");
-                                                }
-                                                if let Err(err) = ep.flush_async().await {
-                                                    tracing::warn!("echo flush error: {err}");
-                                                }
-                                            }
-                                            Err(err) => tracing::warn!("echo request receive error: {err}"),
-                                        }
-                                    } else {
+                                    if send_open || recv_open {
                                         tracing::warn!("ECHO rejected: connection is open");
+                                        continue;
+                                    }
+
+                                    match req.recv_all() {
+                                        Ok(data) => {
+                                            tracing::debug!("echoing {} bytes via bulk IN", data.len());
+                                            let mut ep = ep_tx.lock().await;
+                                            if let Err(err) = ep.send_async(Bytes::from(data)).await {
+                                                tracing::warn!("echo send error: {err}");
+                                            }
+                                            if let Err(err) = ep.flush_async().await {
+                                                tracing::warn!("echo flush error: {err}");
+                                            }
+                                            tracing::debug!("echo sent");
+                                        }
+                                        Err(err) => tracing::warn!("echo request receive error: {err}"),
                                     }
                                 }
 
@@ -810,7 +821,7 @@ impl UpcFunction {
 
                         Event::SetupDeviceToHost(req) => {
                             let ctrl_req = req.ctrl_req();
-                            tracing::debug!("outgoing control request: {ctrl_req:?}");
+                            tracing::trace!("outgoing control request: {ctrl_req:?}");
                             match ctrl_req.request {
                                 ctrl_req::PROBE => {
                                     tracing::debug!("sending probe response");
