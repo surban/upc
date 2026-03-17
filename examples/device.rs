@@ -39,72 +39,85 @@ async fn main() {
     let reg = gadget.bind(&udc).expect("cannot bind to UDC");
     assert!(reg.is_attached());
 
-    println!("Waiting for connection...");
-    let (tx, mut rx) = upc.accept().await.expect("accept failed");
-    assert_eq!(rx.topic(), TOPIC, "wrong topic");
+    loop {
+        println!("Waiting for connection...");
+        let (tx, mut rx) = tokio::select! {
+            res = upc.accept() => res.expect("accept failed"),
+            _ = tokio::signal::ctrl_c() => break,
+        };
 
-    let overall_start = Instant::now();
+        assert_eq!(rx.topic(), TOPIC, "wrong topic");
 
-    let rx_task = tokio::spawn(async move {
-        let mut rx_testdata = TestData::new(HOST_SEED, TEST_PACKET_MAX_SIZE);
-        let mut rx_delay = TestDelayer::new(HOST_SEED);
+        let overall_start = Instant::now();
+
+        let rx_task = tokio::spawn(async move {
+            let mut rx_testdata = TestData::new(HOST_SEED, TEST_PACKET_MAX_SIZE);
+            let mut rx_delay = TestDelayer::new(HOST_SEED);
+
+            let start = Instant::now();
+            let mut total = 0usize;
+
+            println!("Receiving...");
+            for n in 0..TEST_PACKETS {
+                let data = rx.recv().await.expect("receive failed").expect("unexpected EOF");
+                eprintln!("Recv {n}: {} bytes", data.len());
+                total += data.len();
+                rx_testdata.validate(&data);
+                rx_delay.delay().await;
+            }
+
+            let elapsed = start.elapsed().as_secs_f32();
+            println!(
+                "Received {total} bytes in {elapsed:.2} seconds: {} MB/s",
+                total as f32 / elapsed / 1_048_576.
+            );
+
+            println!("Waiting for receiver close");
+            assert_eq!(rx.recv().await.unwrap(), None, "receiver not closed");
+            println!("Receiver closed");
+
+            total
+        });
+
+        let mut tx_testdata = TestData::new(DEVICE_SEED, TEST_PACKET_MAX_SIZE);
+        let mut tx_delay = TestDelayer::new(DEVICE_SEED);
 
         let start = Instant::now();
-        let mut total = 0usize;
+        let mut tx_total = 0;
 
-        println!("Receiving...");
+        println!("Sending");
         for n in 0..TEST_PACKETS {
-            let data = rx.recv().await.expect("receive failed").expect("unexpected EOF");
-            eprintln!("Recv {n}: {} bytes", data.len());
-            total += data.len();
-            rx_testdata.validate(&data);
-            rx_delay.delay().await;
+            let data = tx_testdata.generate();
+            let len = data.len();
+            tx.send(data.into()).await.expect("send failed");
+            tx_total += len;
+            tx_delay.delay().await;
+
+            eprintln!("Send {n}: {len} bytes");
         }
 
         let elapsed = start.elapsed().as_secs_f32();
-        println!("Received {total} bytes in {elapsed:.2} seconds: {} MB/s", total as f32 / elapsed / 1_048_576.);
+        println!(
+            "Sent {tx_total} bytes in {elapsed:.2} seconds: {} MB/s",
+            tx_total as f32 / elapsed / 1_048_576.
+        );
 
-        println!("Waiting for receiver close");
-        assert_eq!(rx.recv().await.unwrap(), None, "receiver not closed");
-        println!("Receiver closed");
+        sleep(Duration::from_secs(3)).await;
 
-        total
-    });
+        println!("Waiting for receiver...");
+        let rx_total = rx_task.await.unwrap();
+        drop(tx);
 
-    let mut tx_testdata = TestData::new(DEVICE_SEED, TEST_PACKET_MAX_SIZE);
-    let mut tx_delay = TestDelayer::new(DEVICE_SEED);
-
-    let start = Instant::now();
-    let mut tx_total = 0;
-
-    println!("Sending");
-    for n in 0..TEST_PACKETS {
-        let data = tx_testdata.generate();
-        let len = data.len();
-        tx.send(data.into()).await.expect("send failed");
-        tx_total += len;
-        tx_delay.delay().await;
-
-        eprintln!("Send {n}: {len} bytes");
+        let overall_elapsed = overall_start.elapsed().as_secs_f32();
+        let total_bytes = tx_total + rx_total;
+        println!(
+            "Total throughput: {} bytes in {overall_elapsed:.2} seconds: {:.2} MB/s",
+            total_bytes,
+            total_bytes as f32 / overall_elapsed / 1_048_576.
+        );
+        println!("Disconnected\n");
     }
 
-    let elapsed = start.elapsed().as_secs_f32();
-    println!("Sent {tx_total} bytes in {elapsed:.2} seconds: {} MB/s", tx_total as f32 / elapsed / 1_048_576.);
-
-    sleep(Duration::from_secs(3)).await;
-
-    println!("Waiting for receiver...");
-    let rx_total = rx_task.await.unwrap();
-    drop(tx);
-
-    let overall_elapsed = overall_start.elapsed().as_secs_f32();
-    let total_bytes = tx_total + rx_total;
-    println!(
-        "Total throughput: {} bytes in {overall_elapsed:.2} seconds: {:.2} MB/s",
-        total_bytes,
-        total_bytes as f32 / overall_elapsed / 1_048_576.
-    );
-    println!("Disconnected");
-
-    sleep(Duration::from_secs(3)).await;
+    drop(reg);
+    sleep(Duration::from_secs(1)).await;
 }

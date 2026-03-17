@@ -75,6 +75,7 @@ All control requests use vendor type, interface recipient, with
 | `0x05` | CLOSE_RECV     | OUT       | empty                       | Optional |
 | `0x06` | STATUS         | IN        | 0–8 bytes: status flags     | Optional |
 | `0x07` | CAPABILITIES   | IN or OUT | TLV-encoded capabilities    | Optional |
+| `0x08` | ECHO           | OUT       | 0–MPS bytes: marker data    | Optional |
 
 ### PROBE (0x00) — Device → Host
 
@@ -198,6 +199,29 @@ Exchanges capability information between host and device.
   **must** use the default capability values defined in section 4.
 
 See section 4 for the TLV encoding and capability definitions.
+
+### ECHO (0x08) — Host → Device
+
+Synchronization barrier for flushing stale bulk IN data.
+
+* The host sends an ECHO request with a marker payload
+  (up to (MPS-1) bytes of random data).
+* The device **must** only accept ECHO when no connection is open.
+  If a connection is open, the device **should** silently ignore the
+  request (accept the control transfer but discard the data).
+* On receiving ECHO, the device sends the marker payload back to the
+  host via the **bulk IN endpoint** using standard short-packet
+  framing.
+* The host reads from the bulk IN endpoint, discarding any stale data,
+  until it receives a transfer matching the marker. At that point all
+  stale data has been drained and the IN endpoint is clean.
+* ECHO is intended to be used between CLOSE and OPEN during connection
+  setup, as a deterministic alternative to timeout-based flushing.
+  This is particularly useful on platforms (e.g. WebUSB) where
+  cancelling pending IN transfers is unreliable.
+* The device advertises support for ECHO via the `echo_supported`
+  capability (see section 4). If the device does not advertise support,
+  the host **must not** send ECHO requests.
 
 3\. Data Framing
 ----------------
@@ -330,6 +354,7 @@ Sent by the device in response to a CAPABILITIES IN request.
 | `0x01` | ping_timeout      | u32 LE (milliseconds) | 0 (disabled) | If non-zero, the device expects STATUS requests within this interval. If no STATUS request arrives in time, the device considers the host dead and closes the connection. 0 disables the timeout. Default: 10,000 ms (10 seconds) when supported. |
 | `0x02` | status_supported  | u8 (0 or 1)          | 0 (false)    | Whether the device handles STATUS requests. The host must not send STATUS if this is 0. |
 | `0x03` | max_size          | u64 LE                | 16,777,216   | Maximum application-level packet size the device can receive (in bytes). Default: 16 MiB. |
+| `0x04` | echo_supported    | u8 (0 or 1)          | 0 (false)    | Whether the device handles ECHO requests. The host must not send ECHO if this is 0. |
 
 ### Host Capabilities
 
@@ -396,12 +421,15 @@ connection. Steps marked *(optional)* may be skipped.
   │                                            │
   │──── CLOSE (reset previous state) ────────>│
   │                                            │
-  │  [flush IN endpoint buffers]               │
-  │                                            │
   │──── CAPABILITIES IN (optional) ───────────>│
   │<─── device capabilities (TLV) ────────────│
   │                                            │
   │──── CAPABILITIES OUT (optional) ──────────>│
+  │                                            │
+  │  [if echo_supported:]                      │
+  │──── ECHO (marker) ────────────────────────>│
+  │<─── marker via bulk IN ───────────────────│
+  │  [discard stale IN data until marker seen] │
   │                                            │
   │──── OPEN (topic bytes) ───────────────────>│
   │                                            │
@@ -416,13 +444,20 @@ Detailed steps:
 2. *(Optional)* Send **INFO** to read device information.
 3. Claim the USB interface. Clear halt condition on both bulk endpoints.
 4. Send **CLOSE** to reset any state from a previous connection.
-5. Flush any stale data from the IN endpoint by reading and discarding
-   until a short timeout elapses with no data received (recommended:
-   10 ms) or the endpoint stalls.
-6. *(Optional)* Send **CAPABILITIES IN** to query device capabilities.
+5. *(Optional)* Send **CAPABILITIES IN** to query device capabilities.
    On failure, use defaults.
-7. *(Optional)* Send **CAPABILITIES OUT** to inform the device of host
+6. *(Optional)* Send **CAPABILITIES OUT** to inform the device of host
    capabilities.
+7. Flush stale data from the IN endpoint. Two methods:
+   * **ECHO barrier** *(recommended, requires `echo_supported`)*: send
+     **ECHO** with a random marker, then read from the IN endpoint
+     until the marker is received. All stale data is deterministically
+     drained. If the echo response does not arrive within a short
+     timeout, generate a new random marker and resend.
+   * **Timeout flush**: read and discard from the IN endpoint until a
+     short timeout elapses with no data received (recommended: 100 ms)
+     or the endpoint stalls. Used as fallback when the device does not
+     advertise `echo_supported`.
 8. Send **OPEN** with the topic payload. The connection is now active.
 9. Exchange data over the bulk endpoints using the framing described
    in section 3.

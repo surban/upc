@@ -52,6 +52,14 @@ impl<T> ResultExt<T> for Option<T> {
     }
 }
 
+/// Sleep for the given number of milliseconds.
+pub async fn sleep(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms).unwrap();
+    });
+    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+}
+
 /// Wait for a click event on the page until user interaction is enabled.
 pub async fn wait_for_interaction(msg: &str) {
     log!("Waiting for user interaction on page");

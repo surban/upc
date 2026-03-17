@@ -784,6 +784,26 @@ impl UpcFunction {
                                     }
                                 }
 
+                                ctrl_req::ECHO => {
+                                    if !send_open && !recv_open {
+                                        match req.recv_all() {
+                                            Ok(data) => {
+                                                tracing::debug!("echoing {} bytes via bulk IN", data.len());
+                                                let mut ep = ep_tx.lock().await;
+                                                if let Err(err) = ep.send_async(Bytes::from(data)).await {
+                                                    tracing::warn!("echo send error: {err}");
+                                                }
+                                                if let Err(err) = ep.flush_async().await {
+                                                    tracing::warn!("echo flush error: {err}");
+                                                }
+                                            }
+                                            Err(err) => tracing::warn!("echo request receive error: {err}"),
+                                        }
+                                    } else {
+                                        tracing::warn!("ECHO rejected: connection is open");
+                                    }
+                                }
+
                                 other => tracing::warn!("unknown control request {other:x}"),
                             }
                         }
@@ -813,6 +833,7 @@ impl UpcFunction {
                                     let caps = DeviceCapabilities {
                                         ping_timeout,
                                         status_supported: true,
+                                        echo_supported: true,
                                         max_size: cfg.max_size,
                                     };
                                     if let Err(err) = req.send(&caps.encode()) {

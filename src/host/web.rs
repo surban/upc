@@ -2,6 +2,7 @@
 
 use bytes::{Bytes, BytesMut};
 use std::{
+    future::Future,
     io::{Error, ErrorKind, Result},
     rc::Rc,
     sync::{Arc, Mutex},
@@ -70,6 +71,15 @@ pub(crate) enum TaskError {
 impl From<webusb_web::Error> for TaskError {
     fn from(err: webusb_web::Error) -> Self {
         Self::WebUsb(err)
+    }
+}
+
+/// Run future with a timeout using the wasm sleep.
+async fn timeout<F: Future>(duration: Duration, future: F) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        result = future => Some(result),
+        () = sleep(duration) => None,
     }
 }
 
@@ -333,7 +343,7 @@ pub async fn connect_with(
     hnd.clear_halt(UsbDirection::Out, ep_out).await.map_err(web_to_io_err)?;
 
     // Close previous connection.
-    tracing::debug!("Closing previous connection");
+    tracing::debug!("closing previous connection");
     let control = UsbControlRequest::new(
         UsbRequestType::Vendor,
         UsbRecipient::Interface,
@@ -433,13 +443,48 @@ pub async fn connect_with(
         out_task(hnd_out, rx_out, ep_out, error_out, mps, half_close_out, status_rx, out_tracer).await;
     });
 
-    // Flush receive buffer.
-    loop {
-        tokio::select! {
-            biased;
-            Some(_) = rx_in.recv() => (),
-            () = sleep(crate::FLUSH_TIMEOUT) => break,
+    // Drain stale data from the bulk IN endpoint by sending ECHO markers
+    // via the control pipe and reading them back through the in_task channel.
+    // If the echo response does not arrive within the timeout, send a new
+    // marker with fresh random data and try again.
+    if caps.echo_supported {
+        tracing::debug!("draining stale data using ECHO barrier");
+        'barrier: loop {
+            let mut echo_marker = vec![0u8; mps.saturating_sub(1)];
+            getrandom::fill(&mut echo_marker).expect("failed to generate random bytes");
+            tracing::debug!("sending ECHO barrier ({} bytes)", echo_marker.len());
+            let echo_req = UsbControlRequest::new(
+                UsbRequestType::Vendor,
+                UsbRecipient::Interface,
+                ctrl_req::ECHO,
+                0,
+                interface.into(),
+            );
+            hnd.control_transfer_out(&echo_req, &echo_marker).await.map_err(web_to_io_err)?;
+
+            loop {
+                match timeout(crate::FLUSH_TIMEOUT, rx_in.recv()).await {
+                    Some(Some(pkt)) if pkt.data() == echo_marker => {
+                        tracing::debug!("ECHO barrier received");
+                        break 'barrier;
+                    }
+                    Some(Some(pkt)) => {
+                        tracing::debug!("discarding {} stale bytes while waiting for ECHO", pkt.data().len());
+                    }
+                    Some(None) => {
+                        tracing::warn!("in_task channel closed while waiting for ECHO barrier");
+                        break 'barrier;
+                    }
+                    None => {
+                        tracing::debug!("ECHO barrier timed out, resending with new marker");
+                        break;
+                    }
+                }
+            }
         }
+    } else {
+        tracing::debug!("draining stale data using timeout");
+        while let Some(Some(_)) = timeout(crate::FLUSH_TIMEOUT, rx_in.recv()).await {}
     }
 
     // Open connection.

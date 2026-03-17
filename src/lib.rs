@@ -88,6 +88,8 @@ mod ctrl_req {
     pub const STATUS: u8 = 6;
     /// Query device capabilities (device-to-host) / set host capabilities (host-to-device).
     pub const CAPABILITIES: u8 = 7;
+    /// Echo data back via the bulk IN endpoint (only when connection is closed).
+    pub const ECHO: u8 = 8;
 
     /// Expected response to a PROBE request.
     pub const PROBE_RESPONSE: &[u8] = b"UPC";
@@ -150,6 +152,8 @@ pub(crate) struct DeviceCapabilities {
     pub ping_timeout: Option<Duration>,
     /// Whether the device supports the STATUS control request.
     pub status_supported: bool,
+    /// Whether the device supports the ECHO control request.
+    pub echo_supported: bool,
     /// Maximum receive size.
     pub max_size: u64,
 }
@@ -157,7 +161,7 @@ pub(crate) struct DeviceCapabilities {
 #[cfg(any(feature = "host", feature = "device", feature = "web"))]
 impl Default for DeviceCapabilities {
     fn default() -> Self {
-        Self { ping_timeout: None, status_supported: false, max_size: MAX_SIZE as u64 }
+        Self { ping_timeout: None, status_supported: false, echo_supported: false, max_size: MAX_SIZE as u64 }
     }
 }
 
@@ -173,6 +177,8 @@ impl DeviceCapabilities {
     const TAG_STATUS_SUPPORTED: u8 = 0x02;
     /// TLV tag for max packet size.
     const TAG_MAX_PACKET_SIZE: u8 = 0x03;
+    /// TLV tag for echo supported.
+    const TAG_ECHO_SUPPORTED: u8 = 0x04;
 
     /// Encodes the capabilities into a byte vector using TLV encoding.
     #[cfg(feature = "device")]
@@ -188,6 +194,9 @@ impl DeviceCapabilities {
 
         // Tag 0x03: max_size as u64.
         tlv::encode(&mut buf, Self::TAG_MAX_PACKET_SIZE, &self.max_size.to_le_bytes());
+
+        // Tag 0x04: echo_supported as u8 (0 = false, 1 = true).
+        tlv::encode(&mut buf, Self::TAG_ECHO_SUPPORTED, &[u8::from(self.echo_supported)]);
 
         buf
     }
@@ -220,6 +229,12 @@ impl DeviceCapabilities {
                             value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
                         ]);
                         caps.max_size = size;
+                    }
+                }
+
+                Self::TAG_ECHO_SUPPORTED => {
+                    if !value.is_empty() {
+                        caps.echo_supported = value[0] != 0;
                     }
                 }
 

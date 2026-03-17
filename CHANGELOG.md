@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning].
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
 ## 0.10.4 - 2026-03-16
+### Added
+- ECHO control request for deterministic flush of stale IN transfers
 ### Fixed
 - host (web): cancel orphaned IN transfers from previous connection on reconnect
 - host (web): release USB interface on connection close
