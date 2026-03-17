@@ -8,9 +8,12 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
-## 0.10.4 - 2026-03-16
+## 0.10.5 - 2026-03-17
 ### Added
-- ECHO control request for deterministic flush of stale IN transfers
+- device: ECHO request handler that echoes marker data back via bulk IN
+- host (web): ECHO-barrier drain of stale IN data
+
+## 0.10.4 - 2026-03-16
 ### Fixed
 - host (web): cancel orphaned IN transfers from previous connection on reconnect
 - host (web): release USB interface on connection close
