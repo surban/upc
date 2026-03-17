@@ -18,6 +18,6 @@
         "UDCs"
     ],
     "rust-analyzer.cargo.features": ["device", "host", "cli"],
-    //"rust-analyzer.cargo.features": ["web"],
-    //"rust-analyzer.cargo.target": "wasm32-unknown-unknown",
+    // "rust-analyzer.cargo.features": ["web"],
+    // "rust-analyzer.cargo.target": "wasm32-unknown-unknown",
 }
