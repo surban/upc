@@ -9,26 +9,25 @@ on:
 env:
   CARGO_TERM_COLOR: always
   KERNEL_VERSION: "6.15.3"
+  WASM_BINDGEN_TAG: "2026-03-17"
 
 jobs:
   test-dummy-hcd:
-    name: Loopback test with dummy_hcd (virtme-ng)
+    name: Loopback test with dummy_hcd
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Update Rust
-        run: rustup update
-
-      - name: Install virtme-ng and dependencies
+      - name: Install dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 zstd busybox-static
-          pip3 install --user virtme-ng
+            qemu-system-x86 zstd busybox-static \
+            build-essential flex bison libelf-dev libssl-dev bc
+          pip install virtme-ng==1.40
 
       - name: Cache kernel tarball
         id: cache-kernel
@@ -37,15 +36,24 @@ jobs:
           path: .misc/kernel-${{ env.KERNEL_VERSION }}.tar.zst
           key: ci-kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('.misc/usb-gadget.config', '.misc/build-kernel.sh') }}
 
-      - name: Install kernel build deps
-        if: steps.cache-kernel.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get install -y --no-install-recommends \
-            build-essential flex bison libelf-dev libssl-dev bc
-
       - name: Build kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: .misc/build-kernel.sh --kernel-version "$KERNEL_VERSION"
+
+      - name: Setup Rust
+        run: |
+          rustup update
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --git https://github.com/rust-wasi-web/wasm-bindgen --tag "$WASM_BINDGEN_TAG"
+
+      - name: Patch wasm-bindgen crates for CI
+        run: |
+          TAG="$WASM_BINDGEN_TAG"
+          GIT="https://github.com/rust-wasi-web/wasm-bindgen"
+          printf '\n[patch.crates-io]\n' >> Cargo.toml
+          for crate in wasm-bindgen wasm-bindgen-futures js-sys web-sys wasm-bindgen-test; do
+            printf '%s = { git = "%s", tag = "%s" }\n' "$crate" "$GIT" "$TAG" >> Cargo.toml
+          done
 
       - name: Build (release)
         run: cargo build --release --all-targets --features cli,host,device
@@ -64,3 +72,26 @@ jobs:
       - name: Run example tests
         run: .misc/cargo-test-runner.sh .misc/test-examples.sh ./target/release
         timeout-minutes: 5
+
+      - name: Pre-install Chrome WebUSB policy
+        run: |
+          sudo mkdir -p /etc/opt/chrome/policies/managed
+          echo '{"WebUsbAllowDevicesForUrls":[{"devices":[{"vendor_id":4,"product_id":5}],"urls":["http://127.0.0.1:8080"]}]}' \
+            | sudo tee /etc/opt/chrome/policies/managed/webusb-test.json > /dev/null
+
+      - name: Build WASM test binary
+        run: cargo test --target wasm32-unknown-unknown --features web --test web --release --no-run 2>&1 | tee /tmp/wasm-build.log
+
+      - name: Run web test
+        run: |
+          set -euo pipefail
+          WASM_BIN=$(grep -oP 'Executable.*\(\K[^)]+' /tmp/wasm-build.log | head -1)
+          if [ -z "$WASM_BIN" ]; then
+            echo "ERROR: Could not find WASM binary path from build output" >&2
+            exit 1
+          fi
+          echo "WASM binary: $WASM_BIN"
+          .misc/cargo-test-runner.sh .misc/test-web.sh ./target/release "$WASM_BIN"
+        env:
+          VM_MEMORY: 6G
+        timeout-minutes: 10
