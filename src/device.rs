@@ -700,7 +700,7 @@ impl UpcFunction {
                                     Self::prepare_in(&ep_rx, max_transfer_size, &mut pool).await;
 
                                     // Accept request from host and start tasks.
-                                    match req.recv_all() {
+                                    match req.recv_all_async().await {
                                         Ok(topic) => {
                                             let (ctx, crx, Head { tx, rx, error }) =
                                                 connection(topic, max_transfer_size, max_send_size, max_recv_size);
@@ -744,7 +744,7 @@ impl UpcFunction {
                                     let _ = ep_tx.lock().await.control()?.discard_fifo();
                                     let _ = ep_rx.lock().await.control()?.discard_fifo();
 
-                                    if let Err(err) = req.recv_all() {
+                                    if let Err(err) = req.recv_all_async().await {
                                         tracing::warn!("close request receive error: {err}");
                                     }
 
@@ -755,7 +755,7 @@ impl UpcFunction {
 
                                 ctrl_req::CLOSE_SEND => {
                                     tracing::debug!("host closed send direction");
-                                    match req.recv_all() {
+                                    match req.recv_all_async().await {
                                         Ok(data) if data.len() >= 8 => {
                                             let total_bytes = u64::from_le_bytes(data[..8].try_into().unwrap());
                                             tracing::debug!("CLOSE_SEND with total_bytes={total_bytes}");
@@ -768,7 +768,7 @@ impl UpcFunction {
 
                                 ctrl_req::CLOSE_RECV => {
                                     tracing::debug!("host closed receive direction");
-                                    if let Err(err) = req.recv_all() {
+                                    if let Err(err) = req.recv_all_async().await {
                                         tracing::warn!("close-recv request receive error: {err}");
                                     }
                                     if send_open {
@@ -781,7 +781,7 @@ impl UpcFunction {
                                 }
 
                                 ctrl_req::CAPABILITIES => {
-                                    match req.recv_all() {
+                                    match req.recv_all_async().await {
                                         Ok(data) => match HostCapabilities::decode(&data) {
                                             Ok(caps) => {
                                                 tracing::debug!("host capabilities: {caps:?}");
@@ -799,7 +799,7 @@ impl UpcFunction {
                                         continue;
                                     }
 
-                                    match req.recv_all() {
+                                    match req.recv_all_async().await {
                                         Ok(data) => {
                                             tracing::debug!("echoing {} bytes via bulk IN", data.len());
                                             let mut ep = ep_tx.lock().await;
@@ -825,14 +825,14 @@ impl UpcFunction {
                             match ctrl_req.request {
                                 ctrl_req::PROBE => {
                                     tracing::debug!("sending probe response");
-                                    if let Err(err) = req.send(ctrl_req::PROBE_RESPONSE) {
+                                    if let Err(err) = req.send_async(ctrl_req::PROBE_RESPONSE).await {
                                         tracing::warn!("probe send error: {err}");
                                     }
                                 }
 
                                 ctrl_req::INFO => {
                                     tracing::debug!("sending info");
-                                    if let Err(err) = req.send(&cfg.lock().await.info) {
+                                    if let Err(err) = req.send_async(&cfg.lock().await.info).await {
                                         tracing::warn!("info send error: {err}");
                                     }
                                 }
@@ -847,7 +847,7 @@ impl UpcFunction {
                                         echo_supported: true,
                                         max_size: cfg.max_size,
                                     };
-                                    if let Err(err) = req.send(&caps.encode()) {
+                                    if let Err(err) = req.send_async(&caps.encode()).await {
                                         tracing::warn!("capabilities send error: {err}");
                                     }
                                 }
@@ -864,7 +864,7 @@ impl UpcFunction {
                                         len += 1;
                                     }
                                     tracing::debug!("sending status ({len} bytes)");
-                                    if let Err(err) = req.send(&buf[..len]) {
+                                    if let Err(err) = req.send_async(&buf[..len]).await {
                                         tracing::warn!("status send error: {err}");
                                     }
                                 }
