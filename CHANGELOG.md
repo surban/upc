@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning].
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
 
+## 1.0.0 - 2026-05-20
+### Fixed
+- device: use async control request IO
+
 ## 0.10.7 - 2026-03-18
 ### Changed
 - host (web): limit number of flush retries
