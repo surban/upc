@@ -209,33 +209,25 @@ impl DeviceCapabilities {
         let mut caps = Self::default();
         for (tag, value) in tlv::decode(data)? {
             match tag {
-                Self::TAG_PING_TIMEOUT => {
-                    if value.len() >= 4 {
-                        let millis = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
-                        caps.ping_timeout =
-                            if millis == 0 { None } else { Some(Duration::from_millis(millis.into())) };
-                    }
+                Self::TAG_PING_TIMEOUT if value.len() >= 4 => {
+                    let millis = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    caps.ping_timeout =
+                        if millis == 0 { None } else { Some(Duration::from_millis(millis.into())) };
                 }
 
-                Self::TAG_STATUS_SUPPORTED => {
-                    if !value.is_empty() {
-                        caps.status_supported = value[0] != 0;
-                    }
+                Self::TAG_STATUS_SUPPORTED if !value.is_empty() => {
+                    caps.status_supported = value[0] != 0;
                 }
 
-                Self::TAG_MAX_PACKET_SIZE => {
-                    if value.len() >= 8 {
-                        let size = u64::from_le_bytes([
-                            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-                        ]);
-                        caps.max_size = size;
-                    }
+                Self::TAG_MAX_PACKET_SIZE if value.len() >= 8 => {
+                    let size = u64::from_le_bytes([
+                        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                    ]);
+                    caps.max_size = size;
                 }
 
-                Self::TAG_ECHO_SUPPORTED => {
-                    if !value.is_empty() {
-                        caps.echo_supported = value[0] != 0;
-                    }
+                Self::TAG_ECHO_SUPPORTED if !value.is_empty() => {
+                    caps.echo_supported = value[0] != 0;
                 }
 
                 _ => { /* unknown tag — skip for forward compatibility */ }
@@ -290,13 +282,11 @@ impl HostCapabilities {
         let mut caps = Self::default();
         for (tag, value) in tlv::decode(data)? {
             match tag {
-                Self::TAG_MAX_PACKET_SIZE => {
-                    if value.len() >= 8 {
-                        let size = u64::from_le_bytes([
-                            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-                        ]);
-                        caps.max_size = size;
-                    }
+                Self::TAG_MAX_PACKET_SIZE if value.len() >= 8 => {
+                    let size = u64::from_le_bytes([
+                        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                    ]);
+                    caps.max_size = size;
                 }
                 _ => { /* unknown tag — skip for forward compatibility */ }
             }
